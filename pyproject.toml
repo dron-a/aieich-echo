@@ -1,7 +1,7 @@
 [project]
 name = "aieich-echo"
 version = "0.1.0"
-description = "Add your description here"
+description = "AIEICH application"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
