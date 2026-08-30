@@ -1,0 +1,27 @@
+# Secrets -- never commit
+.env
+.env.*
+!.env.example
+
+# uv / virtualenv
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.build
+
+# Package manager files that conflict with uv.lock on Heroku
+requirements.txt
+runtime.txt
+Pipfile
+Pipfile.lock
+poetry.lock
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
