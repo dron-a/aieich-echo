@@ -28,9 +28,11 @@ Dependencies: psycopg[binary], httpx. Nothing else -- no ORM, no SDK.
 from __future__ import annotations
 
 import calendar
+import hashlib
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -42,6 +44,8 @@ import httpx
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+
+from app_context import SUBJECT_CONTEXT, BOT_CONTEXT
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -71,10 +75,62 @@ SENT_LOG_RETENTION_DAYS = int(os.environ.get("SENT_LOG_RETENTION_DAYS", "3"))
 # the user's stored schedule is never mutated and survives a later extend.
 # Set LAST_DAY_BOOST=0 to remove it entirely; the query then reverts to
 # exactly what it was before the feature existed.
-LAST_DAY_BOOST = os.environ.get("LAST_DAY_BOOST", "1") not in ("0", "false", "")
-LAST_DAY_EVERY_HOURS = int(os.environ.get("LAST_DAY_EVERY_HOURS", "2"))
-LAST_DAY_START_HOUR = int(os.environ.get("LAST_DAY_START_HOUR", "8"))
-LAST_DAY_END_HOUR = int(os.environ.get("LAST_DAY_END_HOUR", "22"))
+# Deadline boost: as a notice's end_date approaches, fire extra reminders on
+# top of its own schedule, tightening the interval as the deadline nears.
+# Nothing is written to the database -- the rule is derived from end_date at
+# dispatch time, so the user's stored schedule is never mutated.
+#
+# BOOST_BANDS is "threshold:interval" pairs, widest first: with the default,
+# 12+ hours out fires every 6h, 4-11 hours every 3h, under 4 hours hourly.
+# Intervals are counted back from end_date, not from midnight, so the hour
+# of the deadline itself always fires.
+#
+# BOOST_KINDS is which notice_kind values may boost. NULL counts as unknown.
+# Set BOOST_ENABLED=0 to remove it; the query reverts to what it was before
+# the feature existed.
+BOOST_ENABLED = os.environ.get("BOOST_ENABLED", "1") not in ("0", "false", "")
+BOOST_KINDS = frozenset(
+    k.strip().lower()
+    for k in os.environ.get("BOOST_KINDS", "deadline,unknown").split(",")
+    if k.strip()
+)
+
+
+def _parse_bands(raw: str) -> tuple[tuple[int, int], ...]:
+    """Parse "12:6,4:3,0:1" into descending (threshold, interval) pairs.
+
+    Falls back to the default on anything malformed. A cosmetic feature's
+    config must never be able to take down dispatch.
+    """
+    try:
+        bands = []
+        for pair in raw.split(","):
+            threshold, interval = pair.split(":")
+            threshold, interval = int(threshold), int(interval)
+            if threshold < 0 or interval < 1:
+                raise ValueError("threshold must be >= 0 and interval >= 1")
+            bands.append((threshold, interval))
+        if not bands:
+            raise ValueError("no bands")
+        return tuple(sorted(bands, reverse=True))
+    except Exception:
+        log.warning("BOOST_BANDS %r is malformed, using defaults", raw)
+        return ((12, 6), (4, 3), (0, 1))
+
+
+BOOST_BANDS_RAW = os.environ.get("BOOST_BANDS", "12:6,4:3,0:1")
+
+# Quips: a one-line remark prepended to a reminder that fired because of the
+# last-day boost. Cosmetic only. Everything about it is built to cost
+# nothing on an ordinary run and to fail into silence, never into a missed
+# reminder.
+#
+# QUIP_LLM_CHANCE is the probability of asking a model for a fresh line
+# instead of using the static list. 0 disables the LLM path entirely.
+QUIPS_ENABLED = os.environ.get("QUIPS_ENABLED", "1") not in ("0", "false", "")
+QUIP_LLM_CHANCE = float(os.environ.get("QUIP_LLM_CHANCE", "0.3"))
+QUIP_TIMEOUT_S = float(os.environ.get("QUIP_TIMEOUT_S", "8"))
+QUIP_MAX_CHARS = int(os.environ.get("QUIP_MAX_CHARS", "120"))
 
 # The Whatsmiau server runs on an Eco dyno and is probably asleep. The wake
 # ping is fired before anything else so it boots while this bot does its
@@ -98,6 +154,15 @@ log = logging.getLogger("echo_bot")
 # httpx logs every request URL at INFO. Noise, and it puts the API host in
 # Heroku's log drain. Warnings and above only.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Parsed here rather than beside the other config because _parse_bands logs
+# on malformed input, and the logger does not exist until now.
+BOOST_BANDS = _parse_bands(BOOST_BANDS_RAW)
+
+# Rows ending beyond the widest band can never boost, so they are not worth
+# fetching. One hour of slack because remaining time is floored to whole
+# hours: a deadline 12.9h out floors to 12, still inside the widest band.
+BOOST_HORIZON_H = BOOST_BANDS[0][0] + 1
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +199,7 @@ def connect() -> psycopg.Connection:
 # validation -- better than rejecting every patch.
 # ---------------------------------------------------------------------------
 
-SUBJECT_CONTEXT = os.environ.get("SUBJECT_CONTEXT", "").strip()
+
 
 SUBJECT_CODES: set[str] = {"BITS_WILP"} | {
     line.split("->", 1)[0].strip().upper()
@@ -170,7 +235,7 @@ PROVIDERS = (
         "groq",
         "https://api.groq.com/openai/v1",
         "GROQ_API_KEY",
-        os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"),
         json_mode=True,
     ),
     Provider(
@@ -191,50 +256,7 @@ PROVIDERS = (
 
 FAILOVER_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
 
-SYSTEM_PROMPT = """\
-You edit scheduled WhatsApp reminder records for a bot called "echo".
-
-Each item gives a reminder's current stored values and update_message, the
-user's raw request to change it. Work out what changes and return only that.
-
-Return ONLY a JSON object. No prose, no markdown fences:
-
-{"patches": [{"id": <int>, "changes": {<field>: <value>}}]}
-
-Rules:
-- "changes" holds ONLY fields whose value must change. Omit anything
-  unchanged. An item needing no change gets an empty changes object.
-- Editable fields, and nothing else: subject_key, message, start_date,
-  end_date, schedule.
-- The reminder is identified elsewhere. Never emit an echo_title field.
-- Return exactly one patch object per input id, using the id given.
-- Never invent a value the update_message does not support. When it is
-  unclear, ambiguous or contradictory, return an empty changes object.
-- Do not delete or cancel reminders; removal is handled elsewhere. If the
-  user asks to cancel, return an empty changes object.
-
-Field formats:
-- start_date, end_date: ISO 8601 with the +05:30 offset, e.g.
-  "2026-09-01T09:00:00+05:30". start_date must not be after end_date.
-- message: one line, complete, no greeting, includes any timeline the user
-  stated. This is sent verbatim over WhatsApp.
-- subject_key: an UPPERCASE code from the subject list, or BITS_WILP.
-- schedule: an object with "hours" plus EXACTLY ONE of day_interval,
-  weekdays or month_days.
-    {"hours": [...], "day_interval": N}   every Nth day from start_date
-    {"hours": [...], "weekdays": [0-6]}   Mon=0 ... Sun=6
-    {"hours": [...], "month_days": [...]} 1-31, negative from month end
-  hours are integers 0-23, IST, distinct and ascending. Minimum spacing is
-  one hour; if the user asks for anything more frequent, use all 24 hours.
-
-Examples of the mapping from update_message to changes:
-  "update et1 for one more day"   -> {"end_date": "<current end_date +1 day>"}
-  "make it twice a day"           -> {"schedule": {"hours": [10, 22], "day_interval": 1}}
-  "change the text to X"          -> {"message": "X"}
-
-Subject codes:
-{subjects}
-"""
+SYSTEM_PROMPT = BOT_CONTEXT.replace('{subjects}', SUBJECT_CONTEXT)
 
 
 def system_prompt() -> str:
@@ -580,42 +602,54 @@ def day_matches(schedule: dict, start: datetime, target: date) -> bool:
     return target.day in wanted
 
 
-def is_due(row: dict, target_date: date, target_hour: int) -> bool:
+def band_for(hours_left: int) -> int | None:
+    """Boost interval for this much time remaining, or None if too far out.
+
+    The widest band is bounded by the horizon: without that, hours_left >=
+    the widest threshold is always true and a deadline days away would
+    boost forever. SQL already filters those rows out, but the two layers
+    must agree -- this is what makes the function correct on its own.
+    """
+    if hours_left < 0 or hours_left >= BOOST_HORIZON_H:
+        return None
+    for threshold, interval in BOOST_BANDS:
+        if hours_left >= threshold:
+            return interval
+    return None
+
+
+def is_due(row: dict, slot: datetime, target_date: date) -> tuple[bool, bool]:
     """Decide whether a candidate fires in this slot.
 
-    On a notice's final day the boost overrides the day rule entirely: the
-    deadline is today, so an every-N-hours nudge is worth more than the
-    original cadence. The notice's own scheduled hours still fire too.
+    Returns (due, by_boost). by_boost is True only when the deadline boost
+    is what made it fire on an hour the notice would not otherwise have
+    used -- that is the case a quip marks.
+
+    Own scheduled hours always win and never carry a quip. The boost fires
+    on top of them as end_date approaches, on intervals counted back from
+    end_date so the deadline hour itself always lands.
     """
-    hours = row["schedule"]["hours"]
+    if slot.hour in row["schedule"]["hours"]:
+        return day_matches(row["schedule"], row["start_date"], target_date), False
 
-    if LAST_DAY_BOOST and row["end_date"].astimezone(IST).date() == target_date:
-        return target_hour in hours or target_hour % LAST_DAY_EVERY_HOURS == 0
-        # for setting max and min active hours of reminders
-        # return (
-        #     target_hour in hours
-        #     or (
-        #         LAST_DAY_START_HOUR <= target_hour <= LAST_DAY_END_HOUR
-        #         and target_hour % LAST_DAY_EVERY_HOURS == 0
-        #     )
-        # )
+    if BOOST_ENABLED and (row["notice_kind"] or "unknown").strip().lower() in BOOST_KINDS:
+        # Floored to whole hours: a deadline at 23:59 reads as 0 hours left
+        # at the 23:00 slot, which is what makes that final nudge fire.
+        hours_left = int((row["end_date"] - slot).total_seconds() // 3600)
+        interval = band_for(hours_left)
+        if interval and hours_left % interval == 0:
+            return True, True
 
-    # Not the last day: the hour must be one of the notice's own, and the
-    # day rule must match. The hour check is already guaranteed by SQL when
-    # the boost is off, and cheap enough to keep either way.
-    return target_hour in hours and day_matches(
-        row["schedule"], row["start_date"], target_date
-    )
+    return False, False
 
 
 def dispatch_where() -> str:
     """The hour condition, widened only when the boost is enabled."""
-    if not LAST_DAY_BOOST:
+    if not BOOST_ENABLED:
         return "schedule->'hours' @> %(hour)s::jsonb"
     return (
         "(schedule->'hours' @> %(hour)s::jsonb"
-        "\n                   OR (end_date AT TIME ZONE 'Asia/Kolkata')::date"
-        " = %(today)s)"
+        "\n                   OR end_date < %(boost_horizon)s)"
     )
 
 
@@ -627,12 +661,12 @@ def select_and_claim(conn: psycopg.Connection) -> tuple[datetime, list[dict]]:
 
     with conn.cursor(row_factory=dict_row) as cur:
         params = {"slot": slot, "hour": json.dumps([target_hour])}
-        if LAST_DAY_BOOST:
-            params["today"] = target_date
+        if BOOST_ENABLED:
+            params["boost_horizon"] = slot + timedelta(hours=BOOST_HORIZON_H)
         cur.execute(
             """
             SELECT target_group, echo_title, subject_key, message,
-                   start_date, end_date, schedule
+                   start_date, end_date, schedule, notice_kind
             FROM src_notice
             WHERE start_date <= %(slot)s
               AND end_date   >= %(slot)s
@@ -642,7 +676,12 @@ def select_and_claim(conn: psycopg.Connection) -> tuple[datetime, list[dict]]:
         )
         candidates = cur.fetchall()
 
-    due = [r for r in candidates if is_due(r, target_date, target_hour)]
+    due = []
+    for r in candidates:
+        fires, by_boost = is_due(r, slot, target_date)
+        if fires:
+            r["by_boost"] = by_boost
+            due.append(r)
     log.info("%d candidates, %d due after day rule", len(candidates), len(due))
     if not due:
         conn.commit()
@@ -738,6 +777,84 @@ def wait_healthy() -> bool:
         delay = min(delay * 2, 8.0)
 
 
+def _static_quip(seed: str) -> str:
+    """Pick a line deterministically. Imported lazily -- a run with no
+    last-day sends never touches the module."""
+    from quips import QUIPS
+
+    if not QUIPS:
+        return ""
+    idx = int(hashlib.sha1(seed.encode()).hexdigest()[:8], 16) % len(QUIPS)
+    return QUIPS[idx]
+
+
+def _llm_quip() -> str:
+    """One short attempt at a fresh line. No failover, no retries.
+
+    This is cosmetic, so it does not get to spend the budget the core
+    update path relies on: first configured provider only, tight timeout,
+    and any problem at all falls through to the static list.
+    """
+    for p in PROVIDERS:
+        key = os.environ.get(p.key_env)
+        if not key:
+            continue
+        r = httpx.post(
+            p.base_url + "/chat/completions",
+            headers={"Authorization": "Bearer " + key},
+            json={
+                "model": p.model,
+                "temperature": 1.0,
+                "max_tokens": 60,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You write a single dry one-liner nudging Indian "
+                            "MTech AI/ML students about a deadline that falls "
+                            "today. Under 120 characters. Wry, never cruel. "
+                            "No emoji, no quotes, no markdown. Output the line "
+                            "only."
+                        ),
+                    },
+                    {"role": "user", "content": "Write one."},
+                ],
+            },
+            timeout=QUIP_TIMEOUT_S,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    return ""
+
+
+def quip_for(seed: str) -> str:
+    """A remark to prefix a boost-driven reminder, or "" for none.
+
+    Never raises. Every failure path -- missing module, dead provider, bad
+    output, bad config -- returns the empty string, and an empty string
+    means the reminder goes out exactly as it would have anyway.
+    """
+    if not QUIPS_ENABLED:
+        return ""
+
+    try:
+        if QUIP_LLM_CHANCE > 0 and random.random() < QUIP_LLM_CHANCE:
+            try:
+                text = _llm_quip().strip().strip('"')
+                # Reject anything that would look wrong in a group chat.
+                if text and len(text) <= QUIP_MAX_CHARS and text.count("\n") <= 1:
+                    return text
+                log.info("llm quip rejected, using static")
+            except Exception as exc:
+                log.info("llm quip unavailable (%s), using static", type(exc).__name__)
+
+        return _static_quip(seed)
+    except Exception:
+        # Cosmetic feature. Never let it affect a reminder.
+        log.warning("quip lookup failed, sending without one", exc_info=True)
+        return ""
+
+
 def send(slot: datetime, rows: list[dict]) -> None:
     """Send the reminders. Runs with no database connection.
 
@@ -747,6 +864,13 @@ def send(slot: datetime, rows: list[dict]) -> None:
         return
 
     sent = failed = 0
+    print("API_URL",API_URL)
+    # One quip per run, shared by every boost-driven reminder in this slot.
+    # Computed once, and only when a boost row is actually going out.
+    quip = ""
+    if any(r.get("by_boost") for r in rows):
+        quip = quip_for("%s|%02d" % (slot.date(), slot.hour))
+
     with httpx.Client(
         base_url=API_URL,
         headers={"apikey": API_KEY},
@@ -758,6 +882,8 @@ def send(slot: datetime, rows: list[dict]) -> None:
             # update or remove the reminder, so it needs to be visible
             # without competing with the reminder itself.
             text = "*%s*\n%s" % (row["echo_title"], row["message"])
+            if quip and row.get("by_boost"):
+                text = "%s\n\n%s" % (quip, text)
             try:
                 r = client.post(
                     "/message/sendText/" + INSTANCE,

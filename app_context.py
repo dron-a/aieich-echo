@@ -36,7 +36,9 @@ Rules:
   unchanged. An item needing no change gets an empty changes object.
 - Editable fields, and nothing else: subject_key, message, start_date,
   end_date, schedule.
-- The reminder is identified elsewhere. Never emit an echo_title field.
+- The reminder is identified elsewhere. Never emit echo_title, target_group
+  or notice_kind -- these are set when the reminder is created and an update
+  cannot change them.
 - Return exactly one patch object per input id, using the id given.
 - Never invent a value the update_message does not support. When it is
   unclear, ambiguous or contradictory, return an empty changes object.
@@ -46,6 +48,10 @@ Rules:
 Field formats:
 - start_date, end_date: ISO 8601 with the +05:30 offset, e.g.
   "2026-09-01T09:00:00+05:30". start_date must not be after end_date.
+  When the user gives a date with no time, end_date is that date at 23:59.
+  When the user gives a time, use it exactly -- end_date is the last moment
+  the reminder may fire, and how close it is drives how often the reminder
+  repeats near the end.
 - message: one line, complete, no greeting, includes any timeline the user
   stated. This is sent verbatim over WhatsApp.
 - subject_key: an UPPERCASE code from the subject list, or BITS_WILP.
@@ -63,7 +69,5 @@ Examples of the mapping from update_message to changes:
   "change the text to X"          -> {"message": "X"}
 
 Subject codes:
-Only take subject codes from this list, or BITS_WILP, dont invent or guess
-
 {subjects}
 """

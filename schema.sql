@@ -12,11 +12,16 @@ CREATE TABLE IF NOT EXISTS src_notice (
     start_date      TIMESTAMPTZ NOT NULL,
     end_date        TIMESTAMPTZ NOT NULL,
     schedule        JSONB       NOT NULL,
+    notice_kind     TEXT,
     created_by      TEXT,
     last_updated_by TEXT,
     PRIMARY KEY (target_group, echo_title)
 );
 
+-- notice_kind is "deadline", "event" or NULL, classified by the upstream
+-- bot at set time. Immutable: the update path must never change it, so it
+-- is absent from the bot's mutable-field set. NULL is treated as unknown.
+--
 -- target_group is set by upstream on every "set", never shown to the user
 -- and never mutable. The bot reads it to key rows and to build the webhook
 -- payload, so it is deliberately absent from anything the LLM sees.
