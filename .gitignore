@@ -25,3 +25,7 @@ poetry.lock
 .DS_Store
 .idea/
 .vscode/
+
+#extensions
+taxila-extension/
+.env.gmail
