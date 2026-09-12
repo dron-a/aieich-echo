@@ -29,3 +29,4 @@ poetry.lock
 #extensions
 taxila-extension/
 .env.gmail
+dev_suite/
