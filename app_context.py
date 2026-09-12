@@ -74,6 +74,7 @@ Examples of the mapping from update_message to changes:
   "change the text to X"          -> {"message": "X"}
 
 Subject codes:
+Only take subject codes from this list, or BITS_WILP, dont invent or guess
 {subjects}
 """
 
