@@ -16,7 +16,10 @@ a missing mail config or a broken import cannot stop reminders going out.
 import logging
 import sys
 import time
+import os
 
+cal_module = os.environ.get("CALENDAR_MODULE","cal_bot_monthly")
+mail_module = os.environ.get("MAIL_MODULE", "mail_bot")
 
 def main() -> int:
     started = time.monotonic()
@@ -29,7 +32,7 @@ def main() -> int:
     # Each stage is isolated: reminders have already gone out, so nothing
     # downstream is worth failing the run for. Imports are lazy so a missing
     # config or a broken module cannot stop the stages before it.
-    for name in ("mail_bot", "cal_bot"):
+    for name in (mail_module, cal_module):
         try:
             __import__(name).main()
         except Exception:
