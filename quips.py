@@ -104,7 +104,7 @@ QUIPS: tuple[str, ...] = (
   "Even a random baseline does something."
   "This reminder shows up more reliably than most of us."
   "Prompt engineering will not help if nobody presses go."
-  "Second time I'm mentioning this. There will be a third."
+  "nth time I'm mentioning this. There will be a n+1."
   "Hope is not a strategy, though it remains very popular."
   "Haan, yeh reminder tumhare liye hi hai."
   "Latency between knowing and doing is unusually high today."

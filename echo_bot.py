@@ -6,7 +6,7 @@ Hourly echo notice bot. Runs as a Heroku Scheduler one-off dyno.
   2. Purge expired notices from src_notice.
   3. Fire webhooks for notices due in the target hour.
 
-current_affairs is a VIEW over src_notice, so it needs no refresh step.
+current_reminders is a VIEW over src_notice, so it needs no refresh step.
 
 Steps 2 and 3 always run, even when step 1 times out or every LLM provider
 is down. Dispatch never depends on the LLM.
@@ -256,17 +256,23 @@ PROVIDERS = (
 
 FAILOVER_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
 
-SYSTEM_PROMPT = BOT_CONTEXT.replace('{subjects}', SUBJECT_CONTEXT)
+# SYSTEM_PROMPT = BOT_CONTEXT.replace('{subjects}', SUBJECT_CONTEXT)
+SYSTEM_PROMPT = BOT_CONTEXT
 
 
-def system_prompt() -> str:
+def patch_prompt() -> str:
+    """The reminder-update system prompt, with the subject list injected."""
     return SYSTEM_PROMPT.replace(
         "{subjects}", SUBJECT_CONTEXT or "(none supplied; leave subject_key alone)"
     )
 
 
-def call_llm(payload: str, deadline: float) -> str:
-    """POST to the first provider that answers. Raises when all fail."""
+def call_llm(payload: str, deadline: float, system_prompt: str | None = None) -> str:
+    """POST to the first provider that answers. Raises when all fail.
+
+    system_prompt defaults to the reminder-patch prompt built below; the
+    mail bot passes its own.
+    """
     last = "no provider configured"
 
     for p in PROVIDERS:
@@ -282,7 +288,7 @@ def call_llm(payload: str, deadline: float) -> str:
             "temperature": 0,
             "max_tokens": 4000,
             "messages": [
-                {"role": "system", "content": system_prompt()},
+                {"role": "system", "content": system_prompt or patch_prompt()},
                 {"role": "user", "content": payload},
             ],
         }
@@ -334,18 +340,26 @@ class Reject(Exception):
     """Patch failed validation; row is deferred."""
 
 
-def parse_response(raw: str) -> dict[int, dict]:
+def parse_response(raw: str, key: str = "patches") -> dict[int, dict]:
+    """Extract {id: payload} from a model response.
+
+    key selects the list to read and what each item carries: "patches" holds
+    a "changes" object per id, any other key holds the item itself. The mail
+    bot uses "items"; the update path uses the default.
+    """
     text = FENCE.sub("", raw.strip())
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end <= start:
         raise ValueError("no JSON object in response")
 
     out: dict[int, dict] = {}
-    for item in json.loads(text[start : end + 1]).get("patches", []):
+    for item in json.loads(text[start : end + 1]).get(key, []):
         try:
-            out[int(item["id"])] = item.get("changes") or {}
+            out[int(item["id"])] = (
+                (item.get("changes") or {}) if key == "patches" else item
+            )
         except (KeyError, TypeError, ValueError):
-            log.warning("malformed patch item ignored: %r", item)
+            log.warning("malformed item ignored: %r", item)
     return out
 
 
