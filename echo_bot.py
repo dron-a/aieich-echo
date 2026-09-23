@@ -62,6 +62,13 @@ INSTANCE = os.environ["EVOLUTION_INSTANCE"]
 LEAD_MINUTES = int(os.environ.get("LEAD_MINUTES", "0"))
 
 CHUNK_SIZE = int(os.environ.get("LLM_CHUNK_SIZE", "15"))
+
+# Phones allowed to update any reminder, not only their own. Must match the
+# format the upstream bot stores in created_by/updated_by exactly -- this is
+# a string comparison, so "919876543210" and "+91 98765 43210" differ.
+ADMIN_PHONES = [
+    p.strip() for p in os.environ.get("ADMIN_PHONES", "").split(",") if p.strip()
+]
 LLM_DEADLINE_S = int(os.environ.get("LLM_DEADLINE_S", "240"))
 LLM_TIMEOUT_S = int(os.environ.get("LLM_TIMEOUT_S", "60"))
 MAX_PENDING = int(os.environ.get("MAX_PENDING", "200"))
@@ -479,7 +486,19 @@ def _payload(chunk: list[dict]) -> str:
 
 
 def fetch_pending(conn: psycopg.Connection) -> list[dict]:
-    """Clear the previous batch and read this run's staged work."""
+    """Clear the previous batch and read this run's staged work.
+
+    Who may update what is decided by the join:
+      - the owner, on their own reminder
+      - anyone, on a calendar-synced reminder (created_by 'echo_cal')
+      - an admin, on anything
+
+    Each row carries two people. owner is the reminder's created_by and is
+    what the UPDATE targets; stager is who asked for the change and is what
+    last_updated_by records. For an owner editing their own reminder they are
+    the same; for an admin or a human editing a bot reminder they are not,
+    and conflating them makes the UPDATE match nothing.
+    """
     with conn.cursor() as cur:
         # Cleared at the start of a run rather than the end of the previous
         # one, so a failed run leaves its rows inspectable for an hour.
@@ -490,29 +509,85 @@ def fetch_pending(conn: psycopg.Connection) -> list[dict]:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
-            SELECT g.target_group, g.echo_title, g.comments, g.update_message,
-                   g.updated_by,
+            SELECT g.target_group, g.echo_title,
+                   g.updated_by AS stager, s.created_by AS owner,
+                   g.comments, g.update_message,
                    s.subject_key, s.message, s.start_date, s.end_date, s.schedule
             FROM stg_notice g
-            JOIN src_notice s USING (target_group, echo_title)
+            JOIN src_notice s
+              ON s.target_group = g.target_group
+             AND s.echo_title   = g.echo_title
+             AND (s.created_by = g.updated_by
+                  OR s.created_by = 'echo_cal'
+                  OR g.updated_by = ANY(%(admins)s))
             WHERE NOT g.processed
-            ORDER BY g.target_group, g.echo_title
-            LIMIT %s
+            ORDER BY g.target_group, g.echo_title, g.updated_by
+            LIMIT %(limit)s
             """,
-            (MAX_PENDING,),
+            {"admins": ADMIN_PHONES, "limit": MAX_PENDING},
         )
-        pending = cur.fetchall()
+        rows = cur.fetchall()
     conn.commit()
-    return pending
+    return resolve_targets(rows)
 
 
-Resolved = tuple[tuple[str, str], dict, str]
+def resolve_targets(rows: list[dict]) -> list[dict]:
+    """One target reminder per staged update, or none.
+
+    The join can match more than one reminder for a single staged row: an
+    admin asking to update mlops-1 in a group where two people each have
+    one. Applying the change to both is almost certainly wrong, so:
+
+      - if the stager owns one of the matches, that is the one they meant
+      - otherwise, if there is exactly one match, use it
+      - otherwise it is ambiguous and is skipped, logged, and marked done so
+        it does not retry every hour
+
+    The upstream bot is the right place to resolve this -- it can ask the
+    admin whose reminder they mean. This is the backstop if it does not.
+    """
+    by_stage: dict[tuple, list[dict]] = {}
+    for r in rows:
+        by_stage.setdefault((r["target_group"], r["echo_title"], r["stager"]), []).append(r)
+
+    out = []
+    for key, matches in by_stage.items():
+        own = [m for m in matches if m["owner"] == m["stager"]]
+        if own:
+            out.append(own[0])
+        elif len(matches) == 1:
+            out.append(matches[0])
+        else:
+            log.warning(
+                "ambiguous update for %s/%s by %s: %d reminders share that title",
+                key[0], key[1], key[2][-4:], len(matches),
+            )
+            # Flagged rather than dropped, so write_updates marks it processed.
+            out.append({**matches[0], "ambiguous": True})
+    return out
+
+
+# ((target_group, echo_title, owner), stager, changes). owner identifies the
+# reminder -- it is part of src_notice's key. stager is who asked, and is
+# what stg_notice is keyed on and what last_updated_by records. The two
+# differ when an admin edits someone else's reminder or a human edits a bot
+# one. changes is None for a staged row that cannot be applied (ambiguous)
+# but must still be marked processed.
+Resolved = tuple[tuple[str, str, str], str, dict | None]
 
 
 def resolve_updates(pending: list[dict]) -> list[Resolved]:
     """LLM round trips and validation. Runs with no database connection."""
     deadline = time.monotonic() + LLM_DEADLINE_S
     out: list[Resolved] = []
+
+    # Ambiguous rows never reach the model -- there is no single reminder to
+    # patch. They go straight through as unapplied so they are still marked
+    # processed and do not retry every hour.
+    for row in [r for r in pending if r.get("ambiguous")]:
+        out.append(((row["target_group"], row["echo_title"], row["owner"]),
+                    row["stager"], None))
+    pending = [r for r in pending if not r.get("ambiguous")]
 
     for offset in range(0, len(pending), CHUNK_SIZE):
         if time.monotonic() > deadline:
@@ -529,13 +604,13 @@ def resolve_updates(pending: list[dict]) -> list[Resolved]:
         # ids are positional within this request only -- unique per call,
         # never stored. Keeps the identity fields out of the model's output.
         for i, row in enumerate(chunk, 1):
-            key = (row["target_group"], row["echo_title"])
+            key = (row["target_group"], row["echo_title"], row["owner"])
             try:
                 changes = validate(patches.get(i, {}), row)
             except Reject as exc:
-                log.warning("rejected patch for %s/%s: %s", *key, exc)
+                log.warning("rejected patch for %s/%s: %s", key[0], key[1], exc)
                 continue
-            out.append((key, changes, row["updated_by"] or "echo_bot"))
+            out.append((key, row["stager"], changes))
 
     return out
 
@@ -546,33 +621,46 @@ def write_updates(conn: psycopg.Connection, resolved: list[Resolved]) -> None:
         return
 
     with conn.cursor() as cur:
-        for key, changes, updated_by in resolved:
+        for key, stager, changes in resolved:
             if not changes:
-                log.info("no change for %s/%s", *key)
+                if changes is None:
+                    log.info("skipped ambiguous %s/%s", key[0], key[1])
+                else:
+                    log.info("no change for %s/%s", key[0], key[1])
                 continue
             fields = list(changes)
             cur.execute(
                 "UPDATE src_notice SET "
                 + ", ".join(f + " = %s" for f in fields)
                 + ", last_updated_by = %s"
-                + " WHERE target_group = %s AND echo_title = %s",
+                + " WHERE target_group = %s AND echo_title = %s"
+                + "   AND created_by = %s",
                 [Jsonb(changes[f]) if f == "schedule" else changes[f] for f in fields]
-                + [updated_by, *key],
+                # last_updated_by is the stager; created_by in the WHERE is the
+                # owner. For a human editing a bot reminder this is also what
+                # makes the calendar sync stop overwriting it -- the sync only
+                # touches rows still last updated by echo_cal.
+                + [stager, *key],
             )
             log.info(
                 "updated %s/%s %s",
-                *key,
+                key[0], key[1],
                 json.dumps({k: str(v) for k, v in changes.items()}, ensure_ascii=False),
             )
 
         cur.execute(
             """
             UPDATE stg_notice SET processed = TRUE
-            WHERE (target_group, echo_title) IN (
-                SELECT * FROM unnest(%s::text[], %s::text[])
+            WHERE (target_group, echo_title, updated_by) IN (
+                SELECT * FROM unnest(%s::text[], %s::text[], %s::text[])
             )
             """,
-            ([k[0] for k, _, _ in resolved], [k[1] for k, _, _ in resolved]),
+            # Marked by stager, not owner: stg_notice is keyed on who staged.
+            (
+                [k[0] for k, _, _ in resolved],
+                [k[1] for k, _, _ in resolved],
+                [stager for _, stager, _ in resolved],
+            ),
         )
     conn.commit()
 
@@ -679,7 +767,7 @@ def select_and_claim(conn: psycopg.Connection) -> tuple[datetime, list[dict]]:
             params["boost_horizon"] = slot + timedelta(hours=BOOST_HORIZON_H)
         cur.execute(
             """
-            SELECT target_group, echo_title, subject_key, message,
+            SELECT target_group, echo_title, created_by, subject_key, message,
                    start_date, end_date, schedule, notice_kind
             FROM src_notice
             WHERE start_date <= %(slot)s
@@ -705,20 +793,26 @@ def select_and_claim(conn: psycopg.Connection) -> tuple[datetime, list[dict]]:
     # PK conflict is the guard: a row already claimed for this slot is not
     # returned, so a duplicate or late run cannot resend it. Claiming first
     # means a crash mid-run skips a slot rather than double-sending.
+    #
+    # created_by is part of the claim because it is part of the notice's
+    # identity: two people in one group may each hold a reminder called
+    # mlops-1, and one claiming the slot must not suppress the other.
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO sent_log (target_group, echo_title, target_date, target_hour)
-            SELECT g, t, %s, %s
-            FROM unnest(%s::text[], %s::text[]) AS u(g, t)
+            INSERT INTO sent_log (target_group, echo_title, created_by,
+                                  target_date, target_hour)
+            SELECT g, t, c, %s, %s
+            FROM unnest(%s::text[], %s::text[], %s::text[]) AS u(g, t, c)
             ON CONFLICT DO NOTHING
-            RETURNING target_group, echo_title
+            RETURNING target_group, echo_title, created_by
             """,
             (
                 target_date,
                 target_hour,
                 [r["target_group"] for r in due],
                 [r["echo_title"] for r in due],
+                [r["created_by"] for r in due],
             ),
         )
         claimed = set(cur.fetchall())
@@ -732,7 +826,11 @@ def select_and_claim(conn: psycopg.Connection) -> tuple[datetime, list[dict]]:
     if len(due) - len(claimed):
         log.info("%d already sent for this slot", len(due) - len(claimed))
 
-    return slot, [r for r in due if (r["target_group"], r["echo_title"]) in claimed]
+    return slot, [
+        r
+        for r in due
+        if (r["target_group"], r["echo_title"], r["created_by"]) in claimed
+    ]
 
 
 def _jid_suffix(jid: str) -> str:
