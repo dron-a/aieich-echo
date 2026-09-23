@@ -21,7 +21,6 @@ import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from dateutil.rrule import rrulestr
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -210,6 +209,11 @@ def _occurrences(
     UNTIL is often UTC while DTSTART is local -- dateutil compares them
     correctly, which is the main reason this is not hand-rolled.
     """
+    # Imported here rather than at module top: run.py loads this module
+    # every hour, but RRULE expansion only happens on the one hour in
+    # twenty-four when Teams is polled. dateutil costs ~0.6s to import.
+    from dateutil.rrule import rrulestr
+
     try:
         rule = rrulestr(ev["RRULE"][1], dtstart=start)
     except Exception:
