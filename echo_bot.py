@@ -239,22 +239,22 @@ class Provider:
 
 PROVIDERS = (
     Provider(
+        "gemini",
+        os.environ.get("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta/openai"),
+        "GEMINI_API_KEY",
+        os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite"),
+        json_mode=True,
+    ),
+    Provider(
         "groq",
-        "https://api.groq.com/openai/v1",
+        os.environ.get("GROQ_URL", "https://api.groq.com/openai/v1"),
         "GROQ_API_KEY",
         os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"),
         json_mode=True,
     ),
     Provider(
-        "gemini",
-        "https://generativelanguage.googleapis.com/v1beta/openai",
-        "GEMINI_API_KEY",
-        os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
-        json_mode=True,
-    ),
-    Provider(
         "openrouter",
-        "https://openrouter.ai/api/v1",
+        os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1"),
         "OPENROUTER_API_KEY",
         os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
         json_mode=False,
