@@ -46,6 +46,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from app_context import SUBJECT_CONTEXT, BOT_CONTEXT
+from echo_bot import env_bool
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -75,7 +76,7 @@ SENT_LOG_RETENTION_DAYS = int(os.environ.get("SENT_LOG_RETENTION_DAYS", "3"))
 # the user's stored schedule is never mutated and survives a later extend.
 # Set LAST_DAY_BOOST=0 to remove it entirely; the query then reverts to
 # exactly what it was before the feature existed.
-LAST_DAY_BOOST = os.environ.get("LAST_DAY_BOOST", "1") not in ("0", "false", "")
+LAST_DAY_BOOST = env_bool("LAST_DAY_BOOST", True)
 LAST_DAY_EVERY_HOURS = int(os.environ.get("LAST_DAY_EVERY_HOURS", "2"))
 
 # Quips: a one-line remark prepended to a reminder that fired because of the
@@ -85,7 +86,7 @@ LAST_DAY_EVERY_HOURS = int(os.environ.get("LAST_DAY_EVERY_HOURS", "2"))
 #
 # QUIP_LLM_CHANCE is the probability of asking a model for a fresh line
 # instead of using the static list. 0 disables the LLM path entirely.
-QUIPS_ENABLED = os.environ.get("QUIPS_ENABLED", "1") not in ("0", "false", "")
+QUIPS_ENABLED = env_bool("QUIPS_ENABLED", True)
 QUIP_LLM_CHANCE = float(os.environ.get("QUIP_LLM_CHANCE", "0.3"))
 QUIP_TIMEOUT_S = float(os.environ.get("QUIP_TIMEOUT_S", "8"))
 QUIP_MAX_CHARS = int(os.environ.get("QUIP_MAX_CHARS", "120"))

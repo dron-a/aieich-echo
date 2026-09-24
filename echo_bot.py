@@ -47,6 +47,12 @@ from psycopg.types.json import Jsonb
 
 from app_context import SUBJECT_CONTEXT, BOT_CONTEXT
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
 IST = ZoneInfo("Asia/Kolkata")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -95,7 +101,7 @@ SENT_LOG_RETENTION_DAYS = int(os.environ.get("SENT_LOG_RETENTION_DAYS", "3"))
 # BOOST_KINDS is which notice_kind values may boost. NULL counts as unknown.
 # Set BOOST_ENABLED=0 to remove it; the query reverts to what it was before
 # the feature existed.
-BOOST_ENABLED = os.environ.get("BOOST_ENABLED", "1") not in ("0", "false", "")
+BOOST_ENABLED = env_bool("BOOST_ENABLED", True)
 BOOST_KINDS = frozenset(
     k.strip().lower()
     for k in os.environ.get("BOOST_KINDS", "deadline,unknown").split(",")
@@ -134,7 +140,7 @@ BOOST_BANDS_RAW = os.environ.get("BOOST_BANDS", "12:6,4:3,0:1")
 #
 # QUIP_LLM_CHANCE is the probability of asking a model for a fresh line
 # instead of using the static list. 0 disables the LLM path entirely.
-QUIPS_ENABLED = os.environ.get("QUIPS_ENABLED", "1") not in ("0", "false", "")
+QUIPS_ENABLED = env_bool("QUIPS_ENABLED", True)
 QUIP_LLM_CHANCE = float(os.environ.get("QUIP_LLM_CHANCE", "0.3"))
 QUIP_TIMEOUT_S = float(os.environ.get("QUIP_TIMEOUT_S", "8"))
 QUIP_MAX_CHARS = int(os.environ.get("QUIP_MAX_CHARS", "120"))
@@ -170,6 +176,8 @@ BOOST_BANDS = _parse_bands(BOOST_BANDS_RAW)
 # fetching. One hour of slack because remaining time is floored to whole
 # hours: a deadline 12.9h out floors to 12, still inside the widest band.
 BOOST_HORIZON_H = BOOST_BANDS[0][0] + 1
+
+MENTIONS_EVERY_ONE = env_bool("MENTIONS_EVERY_ONE", False)
 
 
 # ---------------------------------------------------------------------------
@@ -996,10 +1004,12 @@ def send(slot: datetime, rows: list[dict]) -> None:
             text = "*%s*\n%s" % (row["echo_title"], row["message"])
             if quip and row.get("by_boost"):
                 text = "%s\n\n%s" % (quip, text)
+            if MENTIONS_EVERY_ONE:
+                text = "%s\n\n%s" % ("@all", text)
             try:
                 r = client.post(
                     "/message/sendText/" + INSTANCE,
-                    json={"number": jid, "text": text},
+                    json={"number": jid, "text": text, "mentionsEveryOne": MENTIONS_EVERY_ONE},
                 )
                 if r.status_code >= 400:
                     # Status only -- never bodies, they carry PII and keys.

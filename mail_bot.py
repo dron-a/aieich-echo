@@ -42,6 +42,7 @@ from echo_bot import (
     call_llm,
     connect,
     parse_response,
+    env_bool,
 )
 
 log = logging.getLogger("mail_bot")
@@ -51,7 +52,7 @@ GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 GMAIL_LABEL = os.environ.get("GMAIL_LABEL", "")
 MAIL_TARGET_GROUP = os.environ.get("MAIL_TARGET_GROUP", "")
 
-MAIL_ENABLED = os.environ.get("MAIL_ENABLED", "1") not in ("0", "false", "")
+MAIL_ENABLED = env_bool("MAIL_ENABLED", True)
 MAIL_LOOKBACK_DAYS = int(os.environ.get("MAIL_LOOKBACK_DAYS", "2"))
 MAIL_MAX_PER_RUN = int(os.environ.get("MAIL_MAX_PER_RUN", "25"))
 MAIL_BODY_CHARS = int(os.environ.get("MAIL_BODY_CHARS", "4000"))
@@ -68,6 +69,7 @@ CODE_RE = re.compile(r"\b((?:S\d-\d{2})_)?(AIML[A-Z]*\d{3})\b")
 
 KINDS = frozenset({"deadline", "event", "announcement"})
 MARKUP = str.maketrans("", "", "*_~`")
+MENTIONS_EVERY_ONE = env_bool("MENTIONS_EVERY_ONE", False)
 
 
 # ---------------------------------------------------------------------------
@@ -327,10 +329,12 @@ def notify(mails: list[dict], items: dict[int, dict]) -> int:
                 continue
 
             text = "*%s*\n%s\n%s" % (mail["prefix"], item["topic"], item["summary"])
+            if MENTIONS_EVERY_ONE:
+                text = "%s\n\n%s" % ("@all", text)
             try:
                 r = client.post(
                     "/message/sendText/" + INSTANCE,
-                    json={"number": MAIL_TARGET_GROUP, "text": text},
+                    json={"number": MAIL_TARGET_GROUP, "text": text, "mentionsEveryOne": MENTIONS_EVERY_ONE},
                 )
                 if r.status_code >= 400:
                     log.error("notify failed: status=%s uid=%d", r.status_code, mail["uid"])

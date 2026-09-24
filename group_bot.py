@@ -39,7 +39,7 @@ import httpx
 import psycopg
 from psycopg.rows import dict_row
 
-from echo_bot import IST, connect
+from echo_bot import IST, connect, env_bool
 
 log = logging.getLogger("group_bot")
 
@@ -47,7 +47,7 @@ TAXILA_API_URL = os.environ.get(
     "TAXILA_API_URL", "https://taxila-aws.bits-pilani.ac.in/webservice/rest/server.php"
 )
 
-GROUP_SYNC_ENABLED = os.environ.get("GROUP_SYNC_ENABLED", "1") not in ("0", "false", "")
+GROUP_SYNC_ENABLED = env_bool("GROUP_SYNC_ENABLED", True)
 GROUP_REFRESH_INTERVAL_H = int(os.environ.get("GROUP_REFRESH_INTERVAL_H", "24"))
 GROUP_TIMEOUT_S = float(os.environ.get("GROUP_TIMEOUT_S", "30"))
 GROUP_MAX_USERS = int(os.environ.get("GROUP_MAX_USERS", "10"))
