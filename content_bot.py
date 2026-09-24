@@ -30,7 +30,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from echo_bot import IST, connect
+from echo_bot import IST, connect, env_bool
 
 log = logging.getLogger("content_bot")
 
@@ -38,7 +38,7 @@ TAXILA_API_URL = os.environ.get(
     "TAXILA_API_URL", "https://taxila-aws.bits-pilani.ac.in/webservice/rest/server.php"
 )
 
-CONTENT_SYNC_ENABLED = os.environ.get("CONTENT_SYNC_ENABLED", "1") not in ("0", "false", "")
+CONTENT_SYNC_ENABLED = env_bool("CONTENT_SYNC_ENABLED", True)
 CONTENT_REFRESH_INTERVAL_H = int(os.environ.get("CONTENT_REFRESH_INTERVAL_H", "24"))
 CONTENT_TIMEOUT_S = float(os.environ.get("CONTENT_TIMEOUT_S", "60"))
 CONTENT_MAX_COURSES = int(os.environ.get("CONTENT_MAX_COURSES", "10"))

@@ -27,7 +27,7 @@ import httpx
 import psycopg
 from psycopg.rows import dict_row
 
-from echo_bot import IST, connect
+from echo_bot import IST, connect, env_bool
 
 log = logging.getLogger("course_bot")
 
@@ -35,7 +35,7 @@ TAXILA_API_URL = os.environ.get(
     "TAXILA_API_URL", "https://taxila-aws.bits-pilani.ac.in/webservice/rest/server.php"
 )
 
-COURSE_SYNC_ENABLED = os.environ.get("COURSE_SYNC_ENABLED", "1") not in ("0", "false", "")
+COURSE_SYNC_ENABLED = env_bool("COURSE_SYNC_ENABLED", True)
 COURSE_REFRESH_INTERVAL_H = int(os.environ.get("COURSE_REFRESH_INTERVAL_H", "720"))
 COURSE_TIMEOUT_S = float(os.environ.get("COURSE_TIMEOUT_S", "30"))
 COURSE_MAX_USERS = int(os.environ.get("COURSE_MAX_USERS", "10"))

@@ -29,7 +29,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 import ics
-from echo_bot import IST, connect
+from echo_bot import IST, connect, env_bool
 from app_context import SUBJECT_NAMES
 
 log = logging.getLogger("cal_bot")
@@ -39,7 +39,7 @@ TAXILA_API_URL = os.environ.get(
     "TAXILA_API_URL", "https://taxila-aws.bits-pilani.ac.in/webservice/rest/server.php"
 )
 
-CAL_ENABLED = os.environ.get("CAL_ENABLED", "1") not in ("0", "false", "")
+CAL_ENABLED = env_bool("CAL_ENABLED", True)
 CAL_BACK_DAYS = int(os.environ.get("CAL_BACK_DAYS", "30"))
 CAL_FWD_DAYS = int(os.environ.get("CAL_FWD_DAYS", "60"))
 CAL_TIMEOUT_S = float(os.environ.get("CAL_TIMEOUT_S", "30"))
@@ -70,7 +70,7 @@ CAL_MAX_PAGES = int(os.environ.get("CAL_MAX_PAGES", "6"))
 # Turn calendar rows into reminders. On by default -- a kill switch, not a
 # trial gate. Capped so that enabling it after a long pause drains over a
 # few hours instead of firing everything at once.
-NOTICE_SYNC = os.environ.get("CALENDAR_NOTICE_SYNC", "1") not in ("0", "false", "")
+NOTICE_SYNC = env_bool("CALENDAR_NOTICE_SYNC", True)
 SYNC_BATCH = int(os.environ.get("CALENDAR_SYNC_BATCH", "20"))
 NOTICE_GROUP = os.environ.get("MAIL_TARGET_GROUP", "")
 
