@@ -21,14 +21,15 @@ the sender re-sending one.
 from __future__ import annotations
 
 import email
+import hashlib
 import imaplib
 import json
 import logging
 import os
 import re
-import uuid
 from datetime import datetime, timedelta
 from email.header import decode_header, make_header
+from email.utils import parsedate_to_datetime
 from app_context import SUMMARY_PROMPT, SUBJECT_NAMES
 
 import psycopg
@@ -177,8 +178,11 @@ def fetch_new_mail(last_uid: int, uid_validity: int) -> tuple[list[dict], int, i
         if status != "OK":
             raise RuntimeError(f"cannot select label {GMAIL_LABEL!r}")
 
-        status, data = imap.status(f'"{GMAIL_LABEL}"', "(UIDVALIDITY)")
+        status, data = imap.status(f'"{GMAIL_LABEL}"', "(UIDVALIDITY UIDNEXT)")
         current_validity = int(re.search(rb"UIDVALIDITY (\d+)", data[0]).group(1))
+        # UIDNEXT is the uid the next arriving message will get, so everything
+        # already in the folder is below it.
+        uid_next = int(re.search(rb"UIDNEXT (\d+)", data[0]).group(1))
 
         if current_validity != uid_validity:
             # Folder was reset: stored UIDs mean nothing now. Fall back to a
@@ -197,6 +201,13 @@ def fetch_new_mail(last_uid: int, uid_validity: int) -> tuple[list[dict], int, i
         # below n -- IMAP treats * as "highest" and flips the range.
         uids = sorted(u for u in uids if u > last_uid or current_validity != uid_validity)
         if not uids:
+            if current_validity != uid_validity:
+                # New or reset folder, and nothing inside the lookback window.
+                # Anchor the cursor at the newest message already there, not at
+                # 0 -- otherwise the next run searches UID 1:* and replays the
+                # whole folder as if it were new mail. uid_next - 1 is 0 for an
+                # empty folder, which is the same result as before.
+                return [], uid_next - 1, current_validity
             return [], last_uid, current_validity
 
         if len(uids) > MAIL_MAX_PER_RUN:
@@ -220,6 +231,8 @@ def fetch_new_mail(last_uid: int, uid_validity: int) -> tuple[list[dict], int, i
                     "body": body,
                     "subject_key": key,
                     "prefix": prefix,
+                    "message_id": (msg.get("Message-ID") or "").strip(),
+                    "sent_at": _sent_at(msg.get("Date")),
                 }
             )
 
@@ -284,15 +297,50 @@ def summarise(mails: list[dict]) -> dict[int, dict]:
 # ---------------------------------------------------------------------------
 
 
+def _sent_at(raw: str | None) -> datetime | None:
+    """The mail's own Date header, or None if missing or unparseable."""
+    if not raw:
+        return None
+    try:
+        dt = parsedate_to_datetime(raw)
+        return dt.astimezone(IST) if dt.tzinfo else dt.replace(tzinfo=IST)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mail_key(message_id: str) -> str:
+    """Stable calendar key for a mail: mail- plus 9 hex characters.
+
+    Hashed from Message-ID, which the sending server sets once and which
+    survives filter-based forwarding. Processing the same mail twice -- a
+    replayed cursor, or a switched mailbox -- produces the same key, so the
+    upsert updates in place instead of inserting a duplicate.
+
+    9 hex characters is 36 bits: collisions become plausible only in the
+    tens of thousands of announcements, far beyond this bot's volume.
+
+    Message-ID is expected but not guaranteed. Without one the key falls
+    back to random, which still works but cannot dedup a replay.
+    """
+    if message_id:
+        return "mail-" + hashlib.sha1(message_id.encode()).hexdigest()[:9]
+    # os.urandom is what uuid4 uses internally; calling it directly avoids
+    # loading the uuid module for a path that almost never runs.
+    return "mail-" + os.urandom(5).hex()[:9]
+
+
 def calendar_rows(mails: list[dict], items: dict[int, dict]) -> list[dict]:
     """Announcements only, for the log.
 
-    start_date and end_date are both the moment the mail arrived: an
-    announcement has no period, and dating it to now means it is already in
-    the past by the next run, so the sync step's "end_date > now()" filter
-    can never pick it up. event_type excludes it as well -- two independent
-    reasons, because a notification-only item becoming a reminder would be
-    a visible bug.
+    start_date and end_date are both the mail's own sent time: an
+    announcement has no period. That date is in the past, so the sync step's
+    "end_date > now()" filter can never pick it up, and event_type excludes
+    it as well -- two independent reasons, because a notification-only item
+    becoming a reminder would be a visible bug.
+
+    The sent time is clamped to now. A sender with a wrong clock could
+    otherwise stamp a future date and quietly remove one of those two
+    guards. A mail with no usable Date header uses now.
     """
     now = datetime.now(IST)
     rows = []
@@ -300,16 +348,18 @@ def calendar_rows(mails: list[dict], items: dict[int, dict]) -> list[dict]:
         item = items.get(i)
         if not item or item["kind"] != "announcement":
             continue
+        sent = mail.get("sent_at")
+        when = min(sent, now) if sent else now
         rows.append(
             {
-                "event_key": "mail-%s" % uuid.uuid4(),
+                "event_key": _mail_key(mail.get("message_id", "")),
                 "source": "mail",
                 "event_type": "announcement",
                 "subject_key": mail["subject_key"],
                 "title": item["topic"][:200],
                 "message": item["summary"],
-                "start_date": now,
-                "end_date": now,
+                "start_date": when,
+                "end_date": when,
             }
         )
     return rows
