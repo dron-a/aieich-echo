@@ -998,6 +998,7 @@ def send(slot: datetime, rows: list[dict]) -> None:
     ) as client:
         for row in rows:
             jid = row["target_group"]
+            requestor = "all"
             # Bold title as a header. It is the handle the user types to
             # update or remove the reminder, so it needs to be visible
             # without competing with the reminder itself.
@@ -1005,11 +1006,13 @@ def send(slot: datetime, rows: list[dict]) -> None:
             if quip and row.get("by_boost"):
                 text = "%s\n\n%s" % (quip, text)
             if MENTIONS_EVERY_ONE:
-                text = "%s\n\n%s" % ("@all", text)
+                if row["created_by"] != 'echo_cal':
+                    requestor = str(row["created_by"])
+                text = "%s\n\n%s" % (f"@{requestor}", text)
             try:
                 r = client.post(
                     "/message/sendText/" + INSTANCE,
-                    json={"number": jid, "text": text, "mentionsEveryOne": MENTIONS_EVERY_ONE},
+                    json={"number": jid, "text": text, "mentioned":[requestor], "mentionsEveryOne": MENTIONS_EVERY_ONE},
                 )
                 if r.status_code >= 400:
                     # Status only -- never bodies, they carry PII and keys.
