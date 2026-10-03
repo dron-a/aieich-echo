@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime
 
 import httpx
@@ -199,14 +200,78 @@ def group_members(
     return data if isinstance(data, list) else []
 
 
+def _norm(text: str) -> str:
+    """Letters only, lowercase, single-spaced -- for comparing names that
+    differ in punctuation: "Hema Aparna Madicharla ." vs the group name."""
+    return " ".join(re.sub(r"[^a-z]+", " ", (text or "").lower()).split())
+
+
+def is_section(group_name: str) -> bool:
+    """Teaching sections are registered as groups: "Section : Prof. X".
+
+    Matched on the first whole word, so "Sectional Lab" is not a section.
+    """
+    words = _norm(group_name).split()
+    return bool(words) and words[0] == "section"
+
+
+def section_instructor(people: list[dict], group_name: str) -> dict | None:
+    """The professor in a section group.
+
+    Matched by name against the group's own title rather than taken as the
+    first entry: Moodle returns members sorted by user id, and the
+    professor comes first only because faculty accounts happen to be older
+    than this cohort's.
+
+    No match returns None and the section is skipped. Falling back to the
+    first entry would label whoever that is -- possibly a student -- as the
+    instructor, which is worse than recording nothing.
+    """
+    if not people:
+        return None
+    wanted = _norm(group_name)
+    for prefix in ("section", "prof"):
+        if wanted.startswith(prefix):
+            wanted = wanted[len(prefix):].strip()
+    for person in people:
+        if wanted and _norm(person.get("fullname")) == wanted:
+            return person
+    log.warning("section %r: no member matches the instructor name, skipped",
+                group_name)
+    return None
+
+
 def rows_for_group(
     people: list[dict], course_id: int, group_id: int, group_name: str
 ) -> list[dict]:
     """Membership rows for one group.
 
-    No filtering here: the groupid option already guarantees every returned
-    user is in this group.
+    No membership filtering here: the groupid option already guarantees
+    every returned user is in this group.
+
+    Section groups keep one row, the professor. A teaching section is the
+    whole cohort under one instructor -- around 150 people -- and as a
+    roster it answers nothing a student asks yet. The instructor's name and
+    email do, so that row is kept, marked so a model reading the table
+    cannot mistake the professor for a teammate.
     """
+    if is_section(group_name):
+        prof = section_instructor(people, group_name)
+        if not prof or not prof.get("id"):
+            return []
+        name = (prof.get("fullname") or "").strip().rstrip(".").strip() or "Unknown"
+        return [
+            {
+                "course_id": course_id,
+                "group_id": group_id,
+                "group_name": group_name,
+                "user_id": prof["id"],
+                "fullname": "Prof. %s (section instructor)" % name,
+                "bits_id": bits_id_of(prof.get("email")),
+                "email": prof.get("email"),
+            }
+        ]
+
     rows = []
     for person in people:
         if not person.get("id"):
@@ -265,6 +330,34 @@ def upsert(conn: psycopg.Connection, rows: list[dict]) -> int:
     return len(rows)
 
 
+def prune(conn: psycopg.Connection, current: dict[int, set[int]]) -> int:
+    """Remove members who have left a group.
+
+    The upsert only inserts or updates, so without this someone who left
+    stays listed forever. Scoped to groups fetched successfully this run:
+    each one's rows are cut down to exactly the members just returned.
+
+    This also collapses an old full section roster to its one instructor
+    row the first time that section is synced after the change -- no
+    manual cleanup needed.
+    """
+    if not current:
+        return 0
+    removed = 0
+    with conn.cursor() as cur:
+        for group_id, user_ids in current.items():
+            cur.execute(
+                "DELETE FROM group_memberships "
+                "WHERE group_id = %s AND NOT (user_id = ANY(%s))",
+                (group_id, list(user_ids)),
+            )
+            removed += cur.rowcount
+    conn.commit()
+    if removed:
+        log.info("removed %d member(s) no longer in their group", removed)
+    return removed
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -287,6 +380,9 @@ def main() -> int:
     # All HTTP with no database connection held.
     rows: list[dict] = []
     done: list[str] = []
+    # group_id -> user ids the group should hold now. Only groups whose
+    # members call succeeded land here, so a failed fetch never prunes.
+    current: dict[int, set[int]] = {}
 
     with httpx.Client(timeout=GROUP_TIMEOUT_S) as client:
         for user_id, token, course_ids in work:
@@ -312,9 +408,15 @@ def main() -> int:
                         ok = False
                         log.warning("members failed for group %s: %s", gid, exc)
                         continue
-                    rows += rows_for_group(
+                    kept = rows_for_group(
                         people, course_id, gid, group.get("name") or str(gid)
                     )
+                    rows += kept
+                    # Empty means a section whose instructor couldn't be
+                    # matched -- uncertain, so its existing rows are left
+                    # alone rather than wiped.
+                    if kept:
+                        current.setdefault(gid, set()).update(r["user_id"] for r in kept)
             # Stamped only on a clean pass, so a user whose fetch failed is
             # retried next hour instead of waiting out the refresh window.
             if ok:
@@ -327,6 +429,7 @@ def main() -> int:
     conn = connect()
     try:
         upsert(conn, list(unique.values()))
+        prune(conn, current)
         stamp(conn, done)
     finally:
         conn.close()

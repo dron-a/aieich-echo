@@ -192,15 +192,16 @@ CREATE INDEX IF NOT EXISTS calendar_unsynced_idx
 -- bot_state keys in use:
 --   mail_last_uid       IMAP UID cursor
 --   mail_uid_validity   folder UIDVALIDITY for that cursor
---   taxila_coverage     {"<user_id>": {"taxila": [...], "teams": [...]}}
---                       which subjects each user's sources yielded, so the
---                       greedy pass can skip users who add no coverage
 --   taxila_last_poll    bucket key for the Taxila gate
 --   teams_last_poll     bucket key for the Teams gate
---   coverage_gaps       {"taxila": [...], "teams": [...]} -- subjects no
+--   coverage_gaps       {"taxila": [...]} -- subjects no
 --                       working token could reach last run. Forces those
 --                       users in on the next run instead of letting the
 --                       greedy pass keep choosing the one that failed.
+-- NOT IN USE RIGHT NOW
+--   taxila_coverage     {"<user_id>": {"taxila": [...], "teams": [...]}}
+--                       which subjects each user's sources yielded, so the
+--                       greedy pass can skip users who add no coverage
 
 -- ---------------------------------------------------------------------------
 -- Group membership. One row per (group, member), NOT per registered user:
@@ -266,6 +267,7 @@ CREATE INDEX IF NOT EXISTS dim_taxila_course_subject_idx
     ON dim_taxila_course (user_id, subject_key);
 CREATE INDEX IF NOT EXISTS dim_taxila_course_current_idx
     ON dim_taxila_course (course_id, enddate);
+
 -- ---------------------------------------------------------------------------
 -- Course content: one row per module, whatever that module happens to be.
 --

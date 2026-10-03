@@ -40,6 +40,7 @@ from echo_bot import (
     API_URL,
     INSTANCE,
     IST,
+    SEND_TIMEOUT_S,
     call_llm,
     connect,
     parse_response,
@@ -365,17 +366,41 @@ def calendar_rows(mails: list[dict], items: dict[int, dict]) -> list[dict]:
     return rows
 
 
-def notify(mails: list[dict], items: dict[int, dict]) -> int:
-    """Post one message per summarised mail. Returns the count sent."""
+def _retryable(status: int) -> bool:
+    """Worth trying again next run: server trouble or rate limiting."""
+    return status >= 500 or status == 429
+
+
+def notify(mails: list[dict], items: dict[int, dict]) -> tuple[int, int]:
+    """Post one message per summarised mail, in uid order.
+
+    Returns (sent, done): how many were sent, and how many mails from the
+    front of the list are finished -- sent, or skipped for good. The cursor
+    advances past exactly those, so anything after a temporary failure is
+    tried again next run.
+
+    Temporary failures -- timeouts, connection errors, 5xx, 429 -- stop the
+    batch. Whatsmiau is struggling, so pressing on would only stack up more
+    timeouts, and the rest are retried next run anyway. A read timeout can
+    mean the message went out after we stopped waiting, so a retry may
+    occasionally duplicate one. Accepted: a duplicate beats a lost mail.
+
+    A permanent rejection (other 4xx) is logged and skipped. Retrying it
+    would fail every run and hold the cursor there, re-sending every later
+    mail each hour behind it.
+    """
     import httpx
 
     sent = 0
     with httpx.Client(
-        base_url=API_URL, headers={"apikey": API_KEY}, timeout=15.0
+        base_url=API_URL, headers={"apikey": API_KEY}, timeout=SEND_TIMEOUT_S
     ) as client:
-        for i, mail in enumerate(mails, 1):
-            item = items.get(i)
+        for done, mail in enumerate(mails):
+            item = items.get(done + 1)
             if not item:
+                # Summary missing or malformed for this one mail. Skipped
+                # rather than retried -- a mail the model cannot summarise
+                # would otherwise hold the cursor forever.
                 continue
 
             text = "*%s*\n%s\n%s" % (mail["prefix"], item["topic"], item["summary"])
@@ -386,14 +411,22 @@ def notify(mails: list[dict], items: dict[int, dict]) -> int:
                     "/message/sendText/" + INSTANCE,
                     json={"number": MAIL_TARGET_GROUP, "text": text, "mentionsEveryOne": MENTIONS_EVERY_ONE},
                 )
-                if r.status_code >= 400:
-                    log.error("notify failed: status=%s uid=%d", r.status_code, mail["uid"])
-                else:
-                    sent += 1
-            except Exception as exc:
-                log.error("notify error: %s uid=%d", type(exc).__name__, mail["uid"])
+            except httpx.TransportError as exc:
+                log.error("notify error: %s uid=%d, retrying next run",
+                          type(exc).__name__, mail["uid"])
+                return sent, done
 
-    return sent
+            if r.status_code < 400:
+                sent += 1
+            elif _retryable(r.status_code):
+                log.error("notify failed: status=%s uid=%d, retrying next run",
+                          r.status_code, mail["uid"])
+                return sent, done
+            else:
+                log.error("notify rejected: status=%s uid=%d, skipped",
+                          r.status_code, mail["uid"])
+
+    return sent, len(mails)
 
 
 # ---------------------------------------------------------------------------
@@ -438,10 +471,13 @@ def main() -> int:
 
     log.info("%d new mail(s)", len(mails))
     items = summarise(mails)
-    sent = notify(mails, items)
+    sent, done = notify(mails, items)
     log.info("notified %d of %d", sent, len(mails))
 
-    rows = calendar_rows(mails, items)
+    # Only the finished prefix is logged and moved past. done is a prefix
+    # count, so calendar_rows' positional ids still line up with items.
+    finished = mails[:done]
+    rows = calendar_rows(finished, items)
     conn = connect()
     try:
         if rows:
@@ -449,7 +485,12 @@ def main() -> int:
 
             cal_bot.upsert(conn, rows)
             log.info("logged %d announcement(s) to calendar", len(rows))
-        write_cursor(conn, max_uid, validity)
+        if done < len(mails):
+            # Stop just before the first unfinished mail.
+            write_cursor(conn, mails[done]["uid"] - 1, validity)
+            log.info("%d mail(s) held back for the next run", len(mails) - done)
+        else:
+            write_cursor(conn, max_uid, validity)
     finally:
         conn.close()
 
