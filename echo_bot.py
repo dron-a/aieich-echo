@@ -79,7 +79,7 @@ LLM_DEADLINE_S = int(os.environ.get("LLM_DEADLINE_S", "240"))
 LLM_TIMEOUT_S = int(os.environ.get("LLM_TIMEOUT_S", "60"))
 MAX_PENDING = int(os.environ.get("MAX_PENDING", "200"))
 
-SEND_TIMEOUT_S = float(os.environ.get("SEND_TIMEOUT_S", "15"))
+SEND_TIMEOUT_S = float(os.environ.get("SEND_TIMEOUT_S", "30"))
 SENT_LOG_RETENTION_DAYS = int(os.environ.get("SENT_LOG_RETENTION_DAYS", "3"))
 
 # Last-day boost: on a notice's final day, fire every N hours regardless of
@@ -101,6 +101,21 @@ SENT_LOG_RETENTION_DAYS = int(os.environ.get("SENT_LOG_RETENTION_DAYS", "3"))
 # BOOST_KINDS is which notice_kind values may boost. NULL counts as unknown.
 # Set BOOST_ENABLED=0 to remove it; the query reverts to what it was before
 # the feature existed.
+# How far ahead an untouched calendar reminder may fire, in days, not
+# counting its open-day reminder.
+#
+# Calendar reminders store their milestones as month_days, which carry no
+# month. On a long assignment the later month's day numbers also match in
+# the earlier one -- a 10 Oct deadline with milestones on 5, 7 and 9 Oct
+# also fires on 5, 7 and 9 Sep. This caps how early that can happen.
+#
+# 27 or less removes the repeats entirely: no 28-day stretch can contain
+# the same day number twice. Higher allows a few through in exchange for
+# earlier nudges on long assignments. Applies only while both created_by
+# and last_updated_by are echo_cal -- once a person edits a reminder, its
+# cadence is theirs.
+CAL_REMINDER_WINDOW_DAYS = int(os.environ.get("CAL_REMINDER_WINDOW_DAYS", "30"))
+
 BOOST_ENABLED = env_bool("BOOST_ENABLED", True)
 BOOST_KINDS = frozenset(
     k.strip().lower()
@@ -214,7 +229,7 @@ def connect() -> psycopg.Connection:
 # validation -- better than rejecting every patch.
 # ---------------------------------------------------------------------------
 
-
+SUBJECT_CONTEXT = os.environ.get("SUBJECT_CONTEXT", "").strip()
 
 SUBJECT_CODES: set[str] = {"BITS_WILP"} | {
     line.split("->", 1)[0].strip().upper()
@@ -728,6 +743,24 @@ def band_for(hours_left: int) -> int | None:
     return None
 
 
+def too_early(row: dict, target_date: date) -> bool:
+    """True if an untouched calendar reminder is further from its deadline
+    than CAL_REMINDER_WINDOW_DAYS allows.
+
+    The open day is exempt -- that reminder is intended whatever the
+    distance. Human reminders, and calendar reminders a person has since
+    edited, are never limited.
+    """
+    if row.get("created_by") != "echo_cal" or row.get("last_updated_by") != "echo_cal":
+        return False
+    if "month_days" not in row["schedule"]:
+        return False
+    if target_date == row["start_date"].astimezone(IST).date():
+        return False
+    days_left = (row["end_date"].astimezone(IST).date() - target_date).days
+    return days_left > CAL_REMINDER_WINDOW_DAYS
+
+
 def is_due(row: dict, slot: datetime, target_date: date) -> tuple[bool, bool]:
     """Decide whether a candidate fires in this slot.
 
@@ -740,7 +773,11 @@ def is_due(row: dict, slot: datetime, target_date: date) -> tuple[bool, bool]:
     end_date so the deadline hour itself always lands.
     """
     if slot.hour in row["schedule"]["hours"]:
-        return day_matches(row["schedule"], row["start_date"], target_date), False
+        if not day_matches(row["schedule"], row["start_date"], target_date):
+            return False, False
+        if too_early(row, target_date):
+            return False, False
+        return True, False
 
     if BOOST_ENABLED and (row["notice_kind"] or "unknown").strip().lower() in BOOST_KINDS:
         # Floored to whole hours: a deadline at 23:59 reads as 0 hours left
@@ -775,7 +812,8 @@ def select_and_claim(conn: psycopg.Connection) -> tuple[datetime, list[dict]]:
             params["boost_horizon"] = slot + timedelta(hours=BOOST_HORIZON_H)
         cur.execute(
             """
-            SELECT target_group, echo_title, created_by, subject_key, message,
+            SELECT target_group, echo_title, created_by, last_updated_by,
+                   subject_key, message,
                    start_date, end_date, schedule, notice_kind
             FROM src_notice
             WHERE start_date <= %(slot)s
@@ -861,35 +899,74 @@ def wake_ping() -> None:
         log.info("wake ping did not complete (%s), boot likely triggered", type(exc).__name__)
 
 
-def wait_healthy() -> bool:
-    """Poll until the server returns 200, up to HEALTH_WAIT_S.
+def _session_state(r: httpx.Response) -> str:
+    """WhatsApp session state from a connectionState response.
 
-    GET on the API root -- that is the health route; sends are POSTs to
-    /message/sendText under the same base. Only 200 counts as ready. An
-    auth rejection is not a boot problem, so it aborts the wait immediately
-    rather than burning the full window on a wrong key.
+    Whatsmiau answers {"id":..,"state":"open","instance":{..,"state":"open"}}.
+    Top-level state first, nested as a fallback for Evolution-style servers.
+    """
+    try:
+        data = r.json()
+    except ValueError:
+        return ""
+    state = data.get("state") or (data.get("instance") or {}).get("state") or ""
+    return str(state).strip().lower()
+
+
+def wait_healthy() -> bool:
+    """Wait until Whatsmiau can actually send, up to HEALTH_WAIT_S.
+
+    Two stages. First the web server must answer 200 on the API root. Then
+    the WhatsApp session itself must report "open".
+
+    The second stage is the one that matters. On the Eco dyno every hourly
+    run is a cold boot, and the web server comes up well before the
+    WhatsApp connection does. A 200 alone said "healthy" while the first
+    send then blocked on the reconnect, outlasted the send timeout, and was
+    reported failed -- sometimes delivered late anyway, sometimes lost.
+
+    An auth rejection is not a boot problem and aborts immediately. A server
+    without the connectionState route is treated as ready on its 200, so an
+    older Whatsmiau keeps working exactly as before.
     """
     deadline = time.monotonic() + HEALTH_WAIT_S
     delay = 1.0
+    server_up = False
+    state_url = "%s/instance/connectionState/%s" % (API_URL.rstrip("/"), INSTANCE)
+    headers = {"apikey": API_KEY}
 
     while True:
         try:
-            r = httpx.get(API_URL, headers={"apikey": API_KEY}, timeout=10.0)
-            if r.status_code == 200:
-                log.info("whatsmiau healthy")
-                return True
+            r = httpx.get(state_url if server_up else API_URL,
+                          headers=headers, timeout=10.0)
             if r.status_code in (401, 403):
                 log.error(
                     "whatsmiau rejected the api key (status=%s) -- not a boot "
                     "problem, check EVOLUTION_API_KEY", r.status_code,
                 )
                 return False
-            reason = "status=%s" % r.status_code
+
+            if not server_up:
+                if r.status_code == 200:
+                    server_up = True
+                    continue  # check the session straight away
+                reason = "status=%s" % r.status_code
+            elif r.status_code == 404:
+                log.warning("connectionState not available, treating server as ready")
+                return True
+            elif r.status_code == 200:
+                state = _session_state(r)
+                if state == "open":
+                    log.info("whatsmiau healthy, whatsapp session open")
+                    return True
+                reason = "session %s" % (state or "unknown")
+            else:
+                reason = "session status=%s" % r.status_code
         except httpx.HTTPError as exc:
             reason = type(exc).__name__
 
         if time.monotonic() + delay > deadline:
-            log.error("whatsmiau not healthy after %.0fs (%s)", HEALTH_WAIT_S, reason)
+            log.error("whatsmiau not ready after %.0fs (%s)", HEALTH_WAIT_S, reason)
             return False
 
         log.info("whatsmiau not ready (%s), retrying in %.0fs", reason, delay)
@@ -984,7 +1061,7 @@ def send(slot: datetime, rows: list[dict]) -> None:
         return
 
     sent = failed = 0
-    print("API_URL",API_URL)
+    # print("API_URL",API_URL)
     # One quip per run, shared by every boost-driven reminder in this slot.
     # Computed once, and only when a boost row is actually going out.
     quip = ""

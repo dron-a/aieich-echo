@@ -201,133 +201,126 @@ def record_poll(results: list[tuple[str, str | None]]) -> None:
         log.warning("could not record poll status: %s", exc)
 
 
-def subjects_for(coverage: dict, uid: str, source: str) -> set[str]:
-    """A user's cached subjects for one source.
+def load_enrollment(conn: psycopg.Connection) -> dict[str, set[str]]:
+    """{user_id: {subject_key}} for each user's current subject courses.
 
-    Tolerates the flat list shape written before Taxila and Teams were
-    gated separately -- those entries only ever held Taxila subjects.
+    Read from dim_taxila_course, which course_bot fills from real enrollment.
+    A course with nothing scheduled yet still counts -- that is the point.
+    Coverage built from returned events could not see a quiet course, so a
+    user whose only unique subject had no events looked redundant and was
+    skipped, and that subject's first assignment was never fetched.
     """
-    entry = coverage.get(uid) or {}
-    if isinstance(entry, list):
-        return set(entry) if source == "taxila" else set()
-    return set(entry.get(source) or [])
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_id, subject_key
+            FROM dim_taxila_course
+            WHERE kind = 'subject'
+              AND enddate > now()
+              AND subject_key IS NOT NULL
+            """
+        )
+        out: dict[str, set[str]] = {}
+        for uid, subject in cur.fetchall():
+            out.setdefault(str(uid), set()).add(subject)
+        return out
+
+
+def select_users(
+    users: list[dict],
+    enrollment: dict[str, set[str]],
+    gaps: dict[str, list[str]] | None = None,
+) -> list[dict]:
+    """Smallest set of Taxila users covering every current enrolled subject.
+
+    One monthly-view call returns all of a user's courses, so the cost is per
+    user, not per subject. Two students in the same courses would fetch the
+    same events; polling one is enough.
+
+    Users with no enrollment rows are always polled -- course_bot has not
+    reached them yet, so nothing is known about what they cover.
+
+    Subjects in gaps (a previous run's poll failed and nobody else enrolled
+    got through) force in everyone enrolled in them, so the greedy pass does
+    not keep choosing the one token that already failed.
+    """
+    wanted = set((gaps or {}).get("taxila") or [])
+    candidates = [u for u in users if u.get("wstoken")]
+
+    def subjects(u: dict) -> set[str]:
+        return enrollment.get(str(u["user_id"]), set())
+
+    unknown = [u for u in candidates if str(u["user_id"]) not in enrollment]
+    known = [u for u in candidates if str(u["user_id"]) in enrollment]
+
+    chosen = list(unknown) + [u for u in known if subjects(u) & wanted]
+    remaining = {s for u in known for s in subjects(u)}
+    remaining -= {s for u in chosen for s in subjects(u)}
+
+    while remaining:
+        best = max(
+            (u for u in known if u not in chosen),
+            key=lambda u: len(remaining & subjects(u)),
+            default=None,
+        )
+        if best is None or not (remaining & subjects(best)):
+            break
+        chosen.append(best)
+        remaining -= subjects(best)
+
+    if len(chosen) < len(candidates):
+        log.info("polling %d of %d Taxila users (by enrollment)", len(chosen), len(candidates))
+    return chosen
 
 
 def cover_gaps(
     client,
     users: list[dict],
-    coverage: dict,
-    seen: dict,
+    enrollment: dict[str, set[str]],
+    succeeded: set[str],
+    failed: set[str],
     polled: set[str],
-    active: set[str],
     poll_one,
 ) -> dict[str, list[str]]:
-    """Re-poll to cover subjects a failed token left unfetched.
+    """Recover Taxila subjects a failed token left unfetched.
 
-    The greedy pass picks a minimum set, so when one of those users fails
-    nobody else was asked for their courses. This finds who else the cache
-    says holds them and polls those, for that source only.
+    A gap is a subject some failed user is enrolled in that no user whose
+    poll succeeded is enrolled in. It is NOT a subject that returned no
+    events -- with coverage from enrollment, a quiet course is normal, and
+    treating it as a gap would force-poll everyone every run.
 
-    Returns whatever is still uncovered. Those subjects are persisted so the
-    next run forces the relevant users in from the start -- without that, the
-    greedy pass keeps choosing the same failed user and the course stays
-    stale indefinitely.
+    Unpolled users enrolled in a gapped subject are polled to fill it.
+    Whatever is still missing is returned and persisted, so the next run
+    forces those users in from the start.
     """
-    still: dict[str, list[str]] = {}
+    def covered() -> set[str]:
+        return {s for uid in succeeded for s in enrollment.get(uid, ())}
 
-    for source in sorted(active):
-        expected = {
-            s for uid in polled for s in subjects_for(coverage, uid, source)
-        }
-        got = {s for found in seen.values() for s in (found.get(source) or ())}
-        missing = expected - got
-        if not missing:
+    needed = {s for uid in failed for s in enrollment.get(uid, ())}
+    missing = needed - covered()
+    if not missing:
+        return {}
+
+    log.warning("taxila gap after first pass: %s", ", ".join(sorted(missing)))
+
+    for user in users:
+        uid = str(user["user_id"])
+        if uid in polled or not user.get("wstoken"):
             continue
-
-        log.warning("%s gap after first pass: %s", source, ", ".join(sorted(missing)))
-
-        for user in users:
-            uid = str(user["user_id"])
-            if uid in polled or not (subjects_for(coverage, uid, source) & missing):
-                continue
-            poll_one(client, user, {source})
-            got |= {s for found in seen.values() for s in (found.get(source) or ())}
-            missing = expected - got
-            if not missing:
-                break
-
-        if missing:
-            # Nobody left who can reach these. Logged loudly because the
-            # affected courses now hold data that will not refresh.
-            log.error(
-                "%s still uncovered, data will go stale: %s",
-                source,
-                ", ".join(sorted(missing)),
-            )
-            still[source] = sorted(missing)
-
-    return still
-
-
-def select_users(
-    users: list[dict],
-    coverage: dict[str, list[str]],
-    gaps: dict[str, list[str]] | None = None,
-) -> list[dict]:
-    """Smallest set of users covering every known subject.
-
-    Greedy set cover over the cached {user_id: [subject_key]} map. Two
-    students on the same course produce identical rows, so polling both is
-    wasted work.
-
-    Users absent from the cache are always polled -- that is what picks up a
-    new registration, with no invalidation step. A cached user who is not
-    selected may drift out of date, which is harmless: the cache only decides
-    who to skip, and the greedy pass never skips the last user covering a
-    subject.
-    """
-    def subjects_of(uid: str) -> set[str]:
-        """Flatten a user's per-source coverage. Tolerates the old flat
-        list shape from before Taxila and Teams were gated separately."""
-        entry = coverage.get(uid) or {}
-        if isinstance(entry, list):
-            return set(entry)
-        return {s for subjects in entry.values() for s in subjects}
-
-    # Subjects a previous run could not fetch at all. Anyone the cache says
-    # holds one is polled regardless of what the greedy pass decides --
-    # otherwise a course whose only token died stays stale forever, because
-    # minimality keeps choosing the user who already failed.
-    wanted = {s for subs in (gaps or {}).values() for s in subs}
-
-    unknown = [u for u in users if str(u["user_id"]) not in coverage]
-    known = [u for u in users if str(u["user_id"]) in coverage]
-
-    forced = [
-        u for u in known
-        if u not in unknown and subjects_of(str(u["user_id"])) & wanted
-    ] if wanted else []
-
-    remaining = {s for u in known for s in subjects_of(str(u["user_id"]))}
-    chosen = list(unknown) + [u for u in forced if u not in unknown]
-    remaining -= {s for u in chosen for s in subjects_of(str(u["user_id"]))}
-
-    while remaining:
-        best, gain = None, 0
-        for u in known:
-            if u in chosen:
-                continue
-            n = len(remaining & subjects_of(str(u["user_id"])))
-            if n > gain:
-                best, gain = u, n
-        if not best:
+        if not (enrollment.get(uid, set()) & missing):
+            continue
+        poll_one(client, user, {"taxila"})
+        missing = needed - covered()
+        if not missing:
             break
-        chosen.append(best)
-        remaining -= subjects_of(str(best["user_id"]))
 
-    if len(chosen) < len(users):
-        log.info("polling %d of %d users (coverage cache)", len(chosen), len(users))
-    return chosen
+    if missing:
+        # Nobody left who can reach these. Logged loudly because the
+        # affected courses now hold data that will not refresh.
+        log.error("taxila still uncovered, data will go stale: %s",
+                  ", ".join(sorted(missing)))
+        return {"taxila": sorted(missing)}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -862,8 +855,7 @@ def main() -> int:
             sync_notices(conn)
             return 0
 
-        coverage_raw = read_state(conn, "taxila_coverage")
-        coverage = json.loads(coverage_raw) if coverage_raw else {}
+        enrollment = load_enrollment(conn) if do_taxila else {}
         gaps_raw = read_state(conn, "coverage_gaps")
         gaps = json.loads(gaps_raw) if gaps_raw else {}
     finally:
@@ -883,32 +875,33 @@ def main() -> int:
     window_end = now + timedelta(days=CAL_FWD_DAYS)
 
     rows: list[dict] = []
-    seen: dict[str, list[str]] = {}
 
     # All network work happens with no database connection held.
     outcomes: dict[str, list[str]] = {}
     polled: set[str] = set()
+    taxila_ok: set[str] = set()
+    taxila_failed: set[str] = set()
 
     def poll_one(client, user, sources: set[str]) -> None:
-        """Poll one user for the named sources, recording what came back.
+        """Poll one user for the named sources.
 
-        found is tracked per source: a Taxila-only run must not wipe the
-        subjects a user's Teams calendar contributed, or the greedy
-        selection would think those courses are uncovered.
+        Taxila success and failure are recorded separately: cover_gaps
+        decides what is missing from which tokens failed, not from which
+        subjects happened to return events.
         """
         uid = str(user["user_id"])
         polled.add(uid)
         errors = outcomes.setdefault(uid, [])
-        found: dict[str, set[str]] = {}
 
         if "taxila" in sources and user.get("wstoken"):
             try:
-                r, s = poll_taxila_user(
+                r, _ = poll_taxila_user(
                     client, user["wstoken"], window_start, window_end
                 )
                 rows.extend(r)
-                found["taxila"] = s
+                taxila_ok.add(uid)
             except Exception as exc:
+                taxila_failed.add(uid)
                 # Truncated: the column is a diagnostic, and a Moodle
                 # exception body can be long. Never log the token.
                 errors.append("taxila: %s" % str(exc)[:200])
@@ -916,30 +909,40 @@ def main() -> int:
 
         if "teams" in sources and user.get("teams_url"):
             try:
-                r, s = poll_teams_user(
+                r, _ = poll_teams_user(
                     client, user["teams_url"], window_start, window_end
                 )
                 rows.extend(r)
-                found["teams"] = s
             except Exception as exc:
                 errors.append("teams: %s" % str(exc)[:200])
                 log.warning("teams poll failed for %s: %s", uid, exc)
 
-        if found:
-            merged = seen.setdefault(uid, {})
-            merged.update(found)
+    # Taxila: the minimum set of users covering every enrolled subject.
+    # Teams: everyone with a calendar URL, no selection. Enrollment cannot
+    # say which courses appear on a given person's Teams calendar, and one
+    # ICS fetch per user per day is cheap enough not to bother narrowing.
+    taxila_pick = select_users(users, enrollment, gaps) if do_taxila else []
+    teams_pick = [u for u in users if u.get("teams_url")] if do_teams else []
 
-    active = {s for s, on in (("taxila", do_taxila), ("teams", do_teams)) if on}
+    taxila_ids = {str(u["user_id"]) for u in taxila_pick}
+    teams_ids = {str(u["user_id"]) for u in teams_pick}
+    order = {str(u["user_id"]): u for u in taxila_pick + teams_pick}
 
     with httpx.Client(timeout=CAL_TIMEOUT_S, follow_redirects=True) as client:
-        for user in select_users(users, coverage, gaps):
-            poll_one(client, user, active)
+        for uid, user in order.items():
+            sources = set()
+            if uid in taxila_ids:
+                sources.add("taxila")
+            if uid in teams_ids:
+                sources.add("teams")
+            poll_one(client, user, sources)
 
-        # A failed token leaves that user's subjects unfetched, and the
-        # greedy pass had already decided nobody else needed polling for
-        # them. Cover the hole with whoever else the cache says has it,
-        # rather than letting a course go stale until the token is fixed.
-        gaps = cover_gaps(client, users, coverage, seen, polled, active, poll_one)
+        if do_taxila:
+            # A failed token leaves its courses unfetched, and the greedy
+            # pass had decided nobody else needed polling for them. Fill
+            # the hole from whoever else is enrolled.
+            gaps = cover_gaps(client, users, enrollment, taxila_ok,
+                              taxila_failed, polled, poll_one)
 
     record_poll([(uid, "; ".join(errs) if errs else None) for uid, errs in outcomes.items()])
 
@@ -951,24 +954,12 @@ def main() -> int:
     try:
         written = upsert(conn, list(unique.values()))
 
-        # Merge per source. A Taxila-only run carries no Teams subjects,
-        # and overwriting the user's entry wholesale would drop them --
-        # the greedy pass would then think those courses are uncovered and
-        # poll everyone again.
-        for uid, found in seen.items():
-            entry = coverage.setdefault(uid, {})
-            if isinstance(entry, list):
-                # Upgrade the old flat shape written by earlier versions.
-                entry = {"taxila": entry}
-                coverage[uid] = entry
-            for source, subjects in found.items():
-                entry[source] = sorted(subjects)
-
-        write_state(conn, "taxila_coverage", json.dumps(coverage))
-        # Persisted so the next run forces in whoever can cover them. An
-        # empty dict clears a gap that has since been filled.
-        write_state(conn, "coverage_gaps", json.dumps(gaps))
         if do_taxila:
+            # Persisted so the next run forces in whoever can cover them.
+            # An empty dict clears a gap that has since been filled. Only
+            # written when Taxila ran -- a Teams-only hour learns nothing
+            # about Taxila gaps and must not clear them.
+            write_state(conn, "coverage_gaps", json.dumps(gaps))
             write_state(conn, "taxila_last_poll", taxila_bucket)
         if do_teams:
             write_state(conn, "teams_last_poll", teams_bucket)
