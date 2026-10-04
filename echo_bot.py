@@ -1085,8 +1085,9 @@ def send(slot: datetime, rows: list[dict]) -> None:
             if MENTIONS_EVERY_ONE:
                 if row["created_by"] != 'echo_cal':
                     requestor = str(row["created_by"])
-                text = "%s\n\n%s" % (f"@{requestor}", text)
-            text = "%s\n\n%s" % ("📢📅⏰ — Scheduled reminder", text)
+                text = "%s\n\n%s" % (f"📢📅⏰ — Scheduled reminder @{requestor}", text)
+            else:
+                text = "%s\n\n%s" % ("📢📅⏰ — Scheduled reminder", text)
             try:
                 r = client.post(
                     "/message/sendText/" + INSTANCE,

@@ -30,3 +30,4 @@ poetry.lock
 taxila-extension/
 .env.gmail
 dev_suite/
+Makefile
