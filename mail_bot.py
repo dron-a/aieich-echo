@@ -405,8 +405,9 @@ def notify(mails: list[dict], items: dict[int, dict]) -> tuple[int, int]:
 
             text = "*%s*\n%s\n%s" % (mail["prefix"], item["topic"], item["summary"])
             if MENTIONS_EVERY_ONE:
-                text = "%s\n\n%s" % ("@all", text)
-            text = "%s\n\n%s" % ("📬🔔 — New mail alert", text)
+                text = "%s\n\n%s" % ("📬🔔 — New mail alert @all", text)
+            else:
+                text = "%s\n\n%s" % ("📬🔔 — New mail alert", text)
             try:
                 r = client.post(
                     "/message/sendText/" + INSTANCE,
