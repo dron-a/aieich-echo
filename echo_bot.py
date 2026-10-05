@@ -1008,13 +1008,13 @@ def _llm_quip() -> str:
                         "role": "system",
                         "content": (
                             "You write a single dry one-liner nudging Indian "
-                            "MTech AI/ML students about a deadline that falls "
+                            "MTech AI/ML students about a deadline for any task that falls "
                             "today. Under 120 characters. Wry, never cruel. "
                             "No emoji, no quotes, no markdown. Output the line "
                             "only."
                         ),
                     },
-                    {"role": "user", "content": "Write one."},
+                    {"role": "user", "content": "Deadline today, we need a clever quip, make it count!"},
                 ],
             },
             timeout=QUIP_TIMEOUT_S,
@@ -1040,11 +1040,12 @@ def quip_for(seed: str) -> str:
                 text = _llm_quip().strip().strip('"')
                 # Reject anything that would look wrong in a group chat.
                 if text and len(text) <= QUIP_MAX_CHARS and text.count("\n") <= 1:
+                    log.info("llm quipped")
                     return text
                 log.info("llm quip rejected, using static")
             except Exception as exc:
                 log.info("llm quip unavailable (%s), using static", type(exc).__name__)
-
+        log.info("static quipped")
         return _static_quip(seed)
     except Exception:
         # Cosmetic feature. Never let it affect a reminder.
@@ -1081,7 +1082,7 @@ def send(slot: datetime, rows: list[dict]) -> None:
             # without competing with the reminder itself.
             text = "*%s*\n%s" % (row["echo_title"], row["message"])
             if quip and row.get("by_boost"):
-                text = "%s\n\n%s" % (quip, text)
+                text = "%s\n%s" % (quip, text)
             if MENTIONS_EVERY_ONE:
                 if row["created_by"] != 'echo_cal':
                     requestor = str(row["created_by"])
