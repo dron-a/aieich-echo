@@ -395,12 +395,15 @@ def prune(conn: psycopg.Connection, current: dict[int, set[int]]) -> int:
 
 def main() -> int:
     if not GROUP_SYNC_ENABLED:
+        log.info("disabled (GROUP_SYNC_ENABLED off)")
         return 0
 
     conn = connect()
     try:
         users = pending_users(conn)
         if not users:
+            log.info("nothing due -- every user's groups synced within %dh",
+                     GROUP_REFRESH_INTERVAL_H)
             return 0
         registered = registered_ids(conn)
         work = [(u["user_id"], u["wstoken"], course_ids_for(conn, u["user_id"]))

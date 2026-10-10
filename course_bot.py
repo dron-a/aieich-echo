@@ -178,6 +178,7 @@ def store(conn: psycopg.Connection, user_id: str, rows: list[dict]) -> None:
 
 def main() -> int:
     if not COURSE_SYNC_ENABLED:
+        log.info("disabled (COURSE_SYNC_ENABLED off)")
         return 0
 
     conn = connect()
@@ -187,6 +188,7 @@ def main() -> int:
         conn.close()
 
     if not users:
+        log.info("nothing due -- no user needs an enrolment sync")
         return 0
 
     log.info("course sync for %d user(s)", len(users))

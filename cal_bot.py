@@ -744,6 +744,7 @@ def sync_notices(conn: psycopg.Connection) -> int:
 
 def main() -> int:
     if not CAL_ENABLED:
+        log.info("disabled (CAL_ENABLED off)")
         return 0
 
     now = datetime.now(IST)
@@ -759,6 +760,7 @@ def main() -> int:
             # Nothing due this hour. The sync step still runs -- it is one
             # indexed lookup, and it is what picks up a flipped kill switch
             # or a row that failed to sync earlier.
+            log.info("taxila and teams polled already this period, sync check only")
             sync_notices(conn)
             # resync_changed(conn)
             return 0

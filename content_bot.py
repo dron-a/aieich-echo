@@ -234,6 +234,7 @@ def store(conn: psycopg.Connection, course_id: int, rows: list[dict]) -> None:
 
 def main() -> int:
     if not CONTENT_SYNC_ENABLED:
+        log.info("disabled (CONTENT_SYNC_ENABLED off)")
         return 0
 
     conn = connect()
@@ -243,6 +244,8 @@ def main() -> int:
         conn.close()
 
     if not courses:
+        log.info("nothing due -- every current course synced within %dh",
+                 CONTENT_REFRESH_INTERVAL_H)
         return 0
 
     log.info("content sync for %d course(s)", len(courses))

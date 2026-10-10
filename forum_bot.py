@@ -380,6 +380,7 @@ def send(messages: list[tuple[dict, str]]) -> list[dict]:
 
 def main() -> int:
     if not FORUM_ENABLED:
+        log.info("disabled (FORUM_ENABLED off)")
         return 0
     if not MAIL_TARGET_GROUP:
         log.error("forum bot not configured, missing MAIL_TARGET_GROUP")
@@ -395,7 +396,10 @@ def main() -> int:
         conn.close()
 
     if not polls:
+        log.info("nothing to poll -- no current subject course with a registered user")
         return 0
+    log.info("polling %d forum view(s) across %d course(s)",
+             len(polls), len({p["course_id"] for p in polls}))
 
     # --- fetch, no connection held ---------------------------------------
     forum_ids = dict(cached)
@@ -475,6 +479,7 @@ def main() -> int:
         log.info("recorded %d older post(s) without sending", len(stale))
 
     if not fresh:
+        log.info("no new announcements")
         return 0
 
     log.info("%d new announcement(s)", len(fresh))
