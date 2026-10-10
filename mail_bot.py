@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -43,8 +44,10 @@ from echo_bot import (
     SEND_TIMEOUT_S,
     call_llm,
     connect,
-    parse_response,
     env_bool,
+    log_send,
+    parse_response,
+    send_attempt,
 )
 
 log = logging.getLogger("mail_bot")
@@ -55,6 +58,12 @@ GMAIL_LABEL = os.environ.get("GMAIL_LABEL", "")
 MAIL_TARGET_GROUP = os.environ.get("MAIL_TARGET_GROUP", "")
 
 MAIL_ENABLED = env_bool("MAIL_ENABLED", True)
+
+# Skip announcement mails that forum_bot already sends from the forum itself.
+# Moodle marks every forum post mail with a List-Id of
+# moodleforum<id>@<site> -- Gmail shows it as "mailing list". Off by default:
+# turn it on once forum_bot is running, or announcements stop entirely.
+MAIL_SKIP_FORUM = env_bool("MAIL_SKIP_FORUM", False)
 MAIL_LOOKBACK_DAYS = int(os.environ.get("MAIL_LOOKBACK_DAYS", "2"))
 MAIL_MAX_PER_RUN = int(os.environ.get("MAIL_MAX_PER_RUN", "25"))
 MAIL_BODY_CHARS = int(os.environ.get("MAIL_BODY_CHARS", "4000"))
@@ -170,6 +179,13 @@ def subject_key_for(subject: str, body: str) -> tuple[str, str]:
     return code, f"{prefix} {name}" if name else prefix
 
 
+def is_forum_mail(msg: email.message.Message) -> bool:
+    """True for a Moodle forum post. Moodle sets List-Id only on forum
+    mail, so this catches announcements and nothing from the programme
+    office, even though both arrive from noreply."""
+    return "moodleforum" in (msg.get("List-Id") or "").lower()
+
+
 def fetch_new_mail(last_uid: int, uid_validity: int) -> tuple[list[dict], int, int]:
     """New mail under the label, oldest first. Returns (mails, max_uid, validity)."""
     imap = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -208,20 +224,25 @@ def fetch_new_mail(last_uid: int, uid_validity: int) -> tuple[list[dict], int, i
                 # 0 -- otherwise the next run searches UID 1:* and replays the
                 # whole folder as if it were new mail. uid_next - 1 is 0 for an
                 # empty folder, which is the same result as before.
-                return [], uid_next - 1, current_validity
-            return [], last_uid, current_validity
+                return [], uid_next - 1, current_validity, 0
+            return [], last_uid, current_validity, 0
 
         if len(uids) > MAIL_MAX_PER_RUN:
             log.warning("%d new mails, capping at %d", len(uids), MAIL_MAX_PER_RUN)
             uids = uids[:MAIL_MAX_PER_RUN]
 
         mails = []
+
+        forum_skipped = 0
         for uid in uids:
             status, data = imap.uid("FETCH", str(uid), "(RFC822)")
             if status != "OK" or not data or not data[0]:
                 log.warning("could not fetch uid %d, skipping", uid)
                 continue
             msg = email.message_from_bytes(data[0][1])
+            if MAIL_SKIP_FORUM and is_forum_mail(msg):
+                forum_skipped += 1
+                continue
             subject = _decode(msg.get("Subject"))
             body = _body(msg)
             key, prefix = subject_key_for(subject, body)
@@ -237,7 +258,9 @@ def fetch_new_mail(last_uid: int, uid_validity: int) -> tuple[list[dict], int, i
                 }
             )
 
-        return mails, max(uids), current_validity
+        if forum_skipped:
+            log.info("skipped %d forum announcement mail(s)", forum_skipped)
+        return mails, max(uids), current_validity, forum_skipped
     finally:
         try:
             imap.logout()
@@ -408,25 +431,26 @@ def notify(mails: list[dict], items: dict[int, dict]) -> tuple[int, int]:
                 text = "%s\n\n%s" % ("📬🔔 — New mail alert @all", text)
             else:
                 text = "%s\n\n%s" % ("📬🔔 — New mail alert", text)
+            ident = "mail uid=%d" % mail["uid"]
+            tags = send_attempt()
+            started = time.monotonic()
             try:
                 r = client.post(
                     "/message/sendText/" + INSTANCE,
                     json={"number": MAIL_TARGET_GROUP, "text": text, "mentionsEveryOne": MENTIONS_EVERY_ONE},
                 )
             except httpx.TransportError as exc:
-                log.error("notify error: %s uid=%d, retrying next run",
-                          type(exc).__name__, mail["uid"])
+                log_send(ident, time.monotonic() - started, tags, exc=exc)
+                log.info("mail uid=%d held for retry next run", mail["uid"])
                 return sent, done
 
-            if r.status_code < 400:
+            if log_send(ident, time.monotonic() - started, tags, r=r):
                 sent += 1
             elif _retryable(r.status_code):
-                log.error("notify failed: status=%s uid=%d, retrying next run",
-                          r.status_code, mail["uid"])
+                log.info("mail uid=%d held for retry next run", mail["uid"])
                 return sent, done
             else:
-                log.error("notify rejected: status=%s uid=%d, skipped",
-                          r.status_code, mail["uid"])
+                log.info("mail uid=%d skipped -- rejected, retrying would not help", mail["uid"])
 
     return sent, len(mails)
 
@@ -460,10 +484,12 @@ def main() -> int:
         conn.close()
 
     # IMAP and the LLM both run with no database connection held.
-    mails, max_uid, validity = fetch_new_mail(last_uid, uid_validity)
+    mails, max_uid, validity, forum_skipped = fetch_new_mail(last_uid, uid_validity)
     if not mails:
         log.info("no new mail")
-        if validity != uid_validity:
+        # Move past skipped forum mails too, or they are refetched and
+        # re-skipped every run until an ordinary mail arrives.
+        if validity != uid_validity or (forum_skipped and max_uid > last_uid):
             conn = connect()
             try:
                 write_cursor(conn, max_uid, validity)

@@ -884,6 +884,100 @@ def _jid_suffix(jid: str) -> str:
     return jid.split("@")[0][-5:]
 
 
+# ---------------------------------------------------------------------------
+# Send diagnostics, shared by every sender in the run: reminders, mail, forum.
+#
+# A failed send used to log only "status=503" or "ReadTimeout", which hid the
+# two facts that explained the failures -- the Whatsmiau dyno had just woken,
+# and this was the first send of the run. Every send now logs how long it
+# took and those circumstances; a failure adds a plain-language cause.
+#
+# Response bodies are never logged whole: they can carry numbers, message
+# text and keys. Only Whatsmiau's own error message field is kept, masked.
+# ---------------------------------------------------------------------------
+
+_RUN = {"cold_boot": False, "sends": 0}
+
+
+def send_attempt() -> str:
+    """Circumstances of the send about to happen. Call once per send."""
+    tags = []
+    if _RUN["cold_boot"]:
+        tags.append("cold boot")
+    if _RUN["sends"] == 0:
+        tags.append("first send of run")
+    _RUN["sends"] += 1
+    return " · ".join(tags)
+
+
+def _mask(text: str) -> str:
+    """Hide phone numbers and anything that looks like a token or key."""
+    text = re.sub(r"\d{6,}", lambda m: "…" + m.group()[-4:], text)
+    return re.sub(r"[A-Za-z0-9_\-]{24,}", "…", text)
+
+
+def error_detail(r: httpx.Response) -> str:
+    """The server's own error message, masked -- never the raw body."""
+    ctype = r.headers.get("content-type", "")
+    if "html" in ctype or r.text.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
+        return "HTML page"
+    try:
+        data = r.json()
+    except ValueError:
+        return ""
+    if isinstance(data, dict):
+        # Most specific first: Evolution-style errors nest the real reason
+        # under response.message and put a generic label in "error".
+        for key in ("response", "message", "error"):
+            val = data.get(key)
+            if isinstance(val, dict):
+                val = val.get("message") or val.get("error")
+            if isinstance(val, list):
+                val = "; ".join(str(v) for v in val)
+            if val:
+                return _mask(str(val))[:160]
+    return ""
+
+
+def failure_cause(elapsed: float, status: int | None = None,
+                  exc: BaseException | None = None) -> str:
+    """Plain-language reason for a failed send."""
+    if exc is not None:
+        if isinstance(exc, httpx.TimeoutException):
+            if _RUN["cold_boot"]:
+                return "no answer in %.0fs -- Whatsmiau likely still reconnecting to WhatsApp after waking" % elapsed
+            return "no answer in %.0fs -- Whatsmiau slow or stuck" % elapsed
+        if isinstance(exc, httpx.ConnectError):
+            return "could not connect -- Whatsmiau down, or EVOLUTION_API_URL wrong"
+        return "connection problem (%s)" % type(exc).__name__
+    if status == 503 and elapsed >= 28:
+        return "Heroku router timeout (likely H12) -- Whatsmiau took over 30s to answer"
+    return {
+        400: "request rejected -- bad number or message",
+        401: "API key rejected -- check EVOLUTION_API_KEY",
+        403: "API key rejected -- check EVOLUTION_API_KEY",
+        404: "instance or route not found -- check EVOLUTION_INSTANCE",
+        429: "rate limited by Whatsmiau",
+        503: "Whatsmiau unavailable",
+    }.get(status, "Whatsmiau server error" if status and status >= 500 else "unexpected response")
+
+
+def log_send(ident: str, elapsed: float, tags: str, r: httpx.Response | None = None,
+             exc: BaseException | None = None) -> bool:
+    """Log one send's outcome. Returns True if it succeeded."""
+    suffix = (" · " + tags) if tags else ""
+    if exc is None and r is not None and r.status_code < 400:
+        log.info("sent %s in %.1fs%s", ident, elapsed, suffix)
+        return True
+    what = type(exc).__name__ if exc is not None else str(r.status_code)
+    cause = failure_cause(elapsed, None if exc is not None else r.status_code, exc)
+    detail = error_detail(r) if r is not None else ""
+    log.error("send failed: %s after %.1fs · %s%s · %s%s",
+              what, elapsed, cause, suffix, ident,
+              (" · server said: " + detail) if detail else "")
+    return False
+
+
 def wake_ping() -> None:
     """Nudge the Whatsmiau dyno awake. Fire and forget, failure is fine.
 
@@ -896,6 +990,7 @@ def wake_ping() -> None:
     except httpx.HTTPError as exc:
         # A sleeping dyno often drops or times out the first request; the
         # ping still triggers the boot.
+        _RUN["cold_boot"] = True
         log.info("wake ping did not complete (%s), boot likely triggered", type(exc).__name__)
 
 
@@ -1089,28 +1184,23 @@ def send(slot: datetime, rows: list[dict]) -> None:
                 text = "%s\n\n%s" % (f"📢📅⏰ — Scheduled reminder @{requestor}", text)
             else:
                 text = "%s\n\n%s" % ("📢📅⏰ — Scheduled reminder", text)
+            ident = "echo_title=%s jid_suffix=%s" % (row["echo_title"], _jid_suffix(jid))
+            tags = send_attempt()
+            started = time.monotonic()
             try:
                 r = client.post(
                     "/message/sendText/" + INSTANCE,
                     json={"number": jid, "text": text, "mentioned":[requestor], "mentionsEveryOne": MENTIONS_EVERY_ONE},
                 )
-                if r.status_code >= 400:
-                    # Status only -- never bodies, they carry PII and keys.
-                    failed += 1
-                    log.error(
-                        "send failed: status=%s jid_suffix=%s echo_title=%s",
-                        r.status_code, _jid_suffix(jid), row["echo_title"],
-                    )
-                else:
-                    sent += 1
+                ok = log_send(ident, time.monotonic() - started, tags, r=r)
             except httpx.HTTPError as exc:
                 # Claim stays. This slot is lost; the next scheduled hour
                 # for this notice fires normally.
+                ok = log_send(ident, time.monotonic() - started, tags, exc=exc)
+            if ok:
+                sent += 1
+            else:
                 failed += 1
-                log.error(
-                    "send error: %s jid_suffix=%s echo_title=%s",
-                    type(exc).__name__, _jid_suffix(jid), row["echo_title"],
-                )
 
     log.info("sent %d, failed %d", sent, failed)
 

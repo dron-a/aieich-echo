@@ -70,13 +70,26 @@ def describe_dates(dates: list[dict]) -> str | None:
     return "; ".join(parts) or None
 
 
+def public_file_url(url: str | None) -> str | None:
+    """A file link a student can open in a browser.
+
+    Moodle's web services return /webservice/pluginfile.php/... URLs, which
+    only work with a token in the query string -- tapped from WhatsApp they
+    fail. The same file at /pluginfile.php/... opens for anyone logged in
+    to Taxila. Nothing else in the URL changes.
+    """
+    if not url:
+        return url
+    return url.replace("/webservice/pluginfile.php/", "/pluginfile.php/", 1)
+
+
 def files_of(module: dict) -> list[dict]:
     """Every file on a module, flattened.
 
     A resource has one, a folder has many or none, a forum has no contents
-    key at all. fileurl is stored as Moodle returns it -- already carrying
-    forcedownload -- because a logged-in student opening it in a browser
-    resolves fine without a token.
+    key at all. fileurl is rewritten from the web-service form to the
+    browser form -- see public_file_url -- so a logged-in student can open
+    it.
     """
     out = []
     for item in module.get("contents") or []:
@@ -85,7 +98,7 @@ def files_of(module: dict) -> list[dict]:
         out.append(
             {
                 "name": item.get("filename"),
-                "url": item["fileurl"],
+                "url": public_file_url(item["fileurl"]),
                 "mime": item.get("mimetype"),
                 "size": item.get("filesize"),
             }
@@ -204,6 +217,15 @@ def store(conn: psycopg.Connection, course_id: int, rows: list[dict]) -> None:
         )
         if cur.rowcount:
             log.info("dropped %d removed module(s) from %s", cur.rowcount, course_id)
+
+        # synced_at means "last checked", which is what pending_courses reads
+        # to decide a course is due. The upsert above skips unchanged rows,
+        # so without this a course whose content never changes keeps its old
+        # timestamp and is refetched every run instead of once a day.
+        cur.execute(
+            "UPDATE dim_course_content SET synced_at = now() WHERE course_id = %s",
+            (course_id,),
+        )
     conn.commit()
 
 
