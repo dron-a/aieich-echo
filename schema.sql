@@ -119,7 +119,8 @@ CREATE TABLE IF NOT EXISTS bot_state (
 --   assignment, quiz -> deadline (syncs to src_notice)
 --   webinar          -> event    (syncs)
 --   class            -> event    (never syncs)
---   announcement     -> none     (never syncs)
+--   announcement     -> none     (never syncs) -- from mail (mail-<hash>)
+--                                 and from course forums (forum-<discussion>)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS calendar (
     -- Stable across polls and across users:
@@ -194,6 +195,10 @@ CREATE INDEX IF NOT EXISTS calendar_unsynced_idx
 --   mail_uid_validity   folder UIDVALIDITY for that cursor
 --   taxila_last_poll    bucket key for the Taxila gate
 --   teams_last_poll     bucket key for the Teams gate
+--   forum_baselined     set by forum_bot's first ever run, which records
+--                       every existing announcement and sends none
+--   forum_ids           {course_id: [forum_id, cmid]} -- each course's
+--                       Announcements forum, cached; these never change
 --   coverage_gaps       {"taxila": [...]} -- subjects no
 --                       working token could reach last run. Forces those
 --                       users in on the next run instead of letting the

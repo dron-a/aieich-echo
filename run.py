@@ -23,6 +23,7 @@ mail_module = os.environ.get("MAIL_MODULE", "mail_bot")
 group_module = os.environ.get("GROUP_MODULE", "group_bot")
 course_module = os.environ.get("COURSE_MODULE", "course_bot")
 content_module = os.environ.get("CONTENT_MODULE", "content_bot")
+forum_module = os.environ.get("FORUM_MODULE", "content_bot")
 
 def main() -> int:
     started = time.monotonic()
@@ -40,7 +41,7 @@ def main() -> int:
     # it, so a newly registered user is fully set up in one pass instead of
     # three. mail_bot is first among these because notifications are the
     # only part users notice promptly.
-    for name in (mail_module, course_module, cal_module, content_module, group_module):
+    for name in (mail_module, course_module, cal_module, content_module, group_module, forum_module):
         try:
             __import__(name).main()
         except Exception:

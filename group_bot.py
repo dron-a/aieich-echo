@@ -241,36 +241,68 @@ def section_instructor(people: list[dict], group_name: str) -> dict | None:
     return None
 
 
+def _member_row(person: dict, course_id: int, group_id: int, group_name: str) -> dict:
+    return {
+        "course_id": course_id,
+        "group_id": group_id,
+        "group_name": group_name,
+        "user_id": person["id"],
+        "fullname": (person.get("fullname") or "").strip() or "Unknown",
+        "bits_id": bits_id_of(person.get("email")),
+        "email": person.get("email"),
+    }
+
+
+def registered_ids(conn: psycopg.Connection) -> set[int]:
+    """Moodle ids of users who can actually be polled -- active, with a token."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT user_id FROM dim_taxila_usr "
+            "WHERE COALESCE(is_active, TRUE) AND wstoken IS NOT NULL"
+        )
+        out = set()
+        for (uid,) in cur.fetchall():
+            try:
+                out.add(int(uid))
+            except (TypeError, ValueError):
+                pass
+        return out
+
+
 def rows_for_group(
-    people: list[dict], course_id: int, group_id: int, group_name: str
+    people: list[dict],
+    course_id: int,
+    group_id: int,
+    group_name: str,
+    registered: set[int] | frozenset = frozenset(),
 ) -> list[dict]:
     """Membership rows for one group.
 
     No membership filtering here: the groupid option already guarantees
     every returned user is in this group.
 
-    Section groups keep one row, the professor. A teaching section is the
-    whole cohort under one instructor -- around 150 people -- and as a
-    roster it answers nothing a student asks yet. The instructor's name and
-    email do, so that row is kept, marked so a model reading the table
-    cannot mistake the professor for a teammate.
+    Section groups keep the professor plus any registered users -- not the
+    whole cohort of around 150. The professor's name and email answer real
+    questions, and are marked so a model reading the table cannot mistake
+    the professor for a teammate. Registered users are kept because
+    forum_bot polls one of them per section to see that section's
+    announcements; it can only poll someone whose token it holds, which is
+    why membership alone is not enough. All registered members are kept,
+    not just one, so a dead token can fall back to another.
     """
     if is_section(group_name):
         prof = section_instructor(people, group_name)
         if not prof or not prof.get("id"):
             return []
         name = (prof.get("fullname") or "").strip().rstrip(".").strip() or "Unknown"
-        return [
-            {
-                "course_id": course_id,
-                "group_id": group_id,
-                "group_name": group_name,
-                "user_id": prof["id"],
-                "fullname": "Prof. %s (section instructor)" % name,
-                "bits_id": bits_id_of(prof.get("email")),
-                "email": prof.get("email"),
-            }
-        ]
+        prof_row = _member_row(prof, course_id, group_id, group_name)
+        prof_row["fullname"] = "Prof. %s (section instructor)" % name
+        rows = [prof_row]
+        for person in people:
+            pid = person.get("id")
+            if pid and pid != prof["id"] and pid in registered:
+                rows.append(_member_row(person, course_id, group_id, group_name))
+        return rows
 
     rows = []
     for person in people:
@@ -370,6 +402,7 @@ def main() -> int:
         users = pending_users(conn)
         if not users:
             return 0
+        registered = registered_ids(conn)
         work = [(u["user_id"], u["wstoken"], course_ids_for(conn, u["user_id"]))
                 for u in users]
     finally:
@@ -409,7 +442,8 @@ def main() -> int:
                         log.warning("members failed for group %s: %s", gid, exc)
                         continue
                     kept = rows_for_group(
-                        people, course_id, gid, group.get("name") or str(gid)
+                        people, course_id, gid, group.get("name") or str(gid),
+                        registered,
                     )
                     rows += kept
                     # Empty means a section whose instructor couldn't be
