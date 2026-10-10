@@ -23,7 +23,7 @@ mail_module = os.environ.get("MAIL_MODULE", "mail_bot")
 group_module = os.environ.get("GROUP_MODULE", "group_bot")
 course_module = os.environ.get("COURSE_MODULE", "course_bot")
 content_module = os.environ.get("CONTENT_MODULE", "content_bot")
-forum_module = os.environ.get("FORUM_MODULE", "content_bot")
+forum_module = os.environ.get("FORUM_MODULE", "forum_bot")
 
 def main() -> int:
     started = time.monotonic()
