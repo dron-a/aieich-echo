@@ -172,12 +172,31 @@ WAKE_TIMEOUT_S = float(os.environ.get("WAKE_TIMEOUT_S", "5"))
 CONNECT_TIMEOUT_S = int(os.environ.get("CONNECT_TIMEOUT_S", "30"))
 CONNECT_ATTEMPTS = int(os.environ.get("CONNECT_ATTEMPTS", "4"))
 
+# Every line carries the stage that wrote it, including lines from shared
+# code such as connect(). run.py sets the stage before each module runs; a
+# module run on its own falls back to its logger name.
+_STAGE = {"name": None}
+
+
+def set_stage(name: str | None) -> None:
+    _STAGE["name"] = name
+
+
+class _StageFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.stage = _STAGE["name"] or record.name
+        return True
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)s [%(stage)s] %(message)s",
     stream=sys.stdout,
 )
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_StageFilter())
 log = logging.getLogger("echo_bot")
+
 
 # httpx logs every request URL at INFO. Noise, and it puts the API host in
 # Heroku's log drain. Warnings and above only.
