@@ -424,7 +424,7 @@ def poll_taxila_user(client: httpx.Client, token: str, start: datetime, end: dat
         if module == "assign" and instance in assign_dates:
             opens, closes = assign_dates[instance]
             end_dt = datetime.fromtimestamp(closes, IST) if closes else deadline
-            start_dt = datetime.fromtimestamp(opens, IST) if opens else end_dt
+            start_dt = datetime.fromtimestamp(opens, IST) if opens else None
             message = "%s (%s) due %s." % (title, name, fmt(end_dt))
             if opens:
                 message += " Open from %s." % fmt(start_dt)
@@ -433,7 +433,7 @@ def poll_taxila_user(client: httpx.Client, token: str, start: datetime, end: dat
         elif module == "quiz" and instance in quiz_dates:
             opens, closes, limit = quiz_dates[instance]
             end_dt = datetime.fromtimestamp(closes, IST) if closes else deadline
-            start_dt = datetime.fromtimestamp(opens, IST) if opens else end_dt
+            start_dt = datetime.fromtimestamp(opens, IST) if opens else None
             message = "%s (%s) closes %s." % (title, name, fmt(end_dt))
             extra = []
             if opens:
@@ -448,7 +448,8 @@ def poll_taxila_user(client: httpx.Client, token: str, start: datetime, end: dat
         else:
             # Third-party modules (groupselect and friends) have no bulk
             # endpoint. The calendar's own timesort is all there is.
-            start_dt = end_dt = deadline
+            # No open date available -- start None, see upsert.
+            end_dt, start_dt = deadline, None
             message = "%s (%s) due %s." % (title, name, fmt(end_dt))
             event_type = "assignment" if e.get("eventtype") == "due" else "quiz"
 
@@ -520,9 +521,23 @@ def poll_teams_user(client: httpx.Client, url: str, start: datetime, end: dateti
 # ---------------------------------------------------------------------------
 
 
+# A start date Taxila did not supply arrives as None. First sight stores the
+# day the bot saw it (or the deadline, if that is earlier). Later polls keep
+# the stored start while it is still before the deadline, so a guess never
+# creeps forward one day per poll; a real date from Taxila always wins. A
+# stored start at or after the deadline -- rows written before this fix,
+# with start equal to end -- falls back to today, which heals them.
+_TODAY_IST = "(date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata')"
+_KEPT_START = """COALESCE(%(start_date)s::timestamptz,
+                     CASE WHEN calendar.start_date < EXCLUDED.end_date
+                          THEN calendar.start_date
+                          ELSE EXCLUDED.start_date END)"""
+
+
 def upsert(conn: psycopg.Connection, rows: list[dict]) -> int:
     """Write calendar rows. echo_title is never touched -- once a row has
-    produced a reminder, that link survives every later poll."""
+    produced a reminder, that link survives every later poll. Unchanged
+    rows are skipped, so updated_at only moves on a real change."""
     if not rows:
         return 0
 
@@ -532,15 +547,23 @@ def upsert(conn: psycopg.Connection, rows: list[dict]) -> int:
             INSERT INTO calendar (event_key, source, event_type, subject_key,
                                   title, message, start_date, end_date)
             VALUES (%(event_key)s, %(source)s, %(event_type)s, %(subject_key)s,
-                    %(title)s, %(message)s, %(start_date)s, %(end_date)s)
+                    %(title)s, %(message)s,
+                    COALESCE(%(start_date)s::timestamptz,
+                             LEAST(""" + _TODAY_IST + """, %(end_date)s::timestamptz)),
+                    %(end_date)s)
             ON CONFLICT (event_key) DO UPDATE SET
                 event_type  = EXCLUDED.event_type,
                 subject_key = EXCLUDED.subject_key,
                 title       = EXCLUDED.title,
                 message     = EXCLUDED.message,
-                start_date  = EXCLUDED.start_date,
+                start_date  = """ + _KEPT_START + """,
                 end_date    = EXCLUDED.end_date,
                 updated_at  = now()
+            WHERE (calendar.title, calendar.message,
+                   calendar.start_date, calendar.end_date, calendar.subject_key)
+                  IS DISTINCT FROM
+                  (EXCLUDED.title, EXCLUDED.message,
+                   """ + _KEPT_START + """, EXCLUDED.end_date, EXCLUDED.subject_key)
             """,
             rows,
         )

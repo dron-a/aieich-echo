@@ -85,6 +85,7 @@ FORUM_TEXT_CHARS = int(os.environ.get("FORUM_TEXT_CHARS", "4000"))
 
 EVERYONE = -1
 
+MENTIONS_EVERY_ONE = env_bool("MENTIONS_EVERY_ONE", False)
 
 # ---------------------------------------------------------------------------
 # Text
@@ -353,12 +354,16 @@ def send(messages: list[tuple[dict, str]]) -> list[dict]:
     with httpx.Client(base_url=API_URL, headers={"apikey": API_KEY},
                       timeout=SEND_TIMEOUT_S) as client:
         for post, text in messages:
+            if MENTIONS_EVERY_ONE:
+                text = "%s\n\n%s" % ("🏫📢 Taxila Announcement @all", text)
+            else:
+                text = "%s\n\n%s" % ("🏫📢 Taxila Announcement", text)
             ident = "forum d=%d" % post["discussion"]
             tags = send_attempt()
             started = time.monotonic()
             try:
                 r = client.post("/message/sendText/" + INSTANCE,
-                                json={"number": MAIL_TARGET_GROUP, "text": text})
+                                json={"number": MAIL_TARGET_GROUP, "text": text, "mentionsEveryOne": MENTIONS_EVERY_ONE})
             except httpx.TransportError as exc:
                 log_send(ident, time.monotonic() - started, tags, exc=exc)
                 log.info("forum d=%d held for retry next run", post["discussion"])

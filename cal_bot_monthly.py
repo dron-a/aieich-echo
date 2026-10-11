@@ -446,8 +446,12 @@ def resolve_dates(rec: dict) -> tuple[datetime, datetime] | None:
             return None
         end = rec["close_day"].replace(hour=23, minute=59, second=0, microsecond=0)
 
-    start = rec["open"] or rec["open_day"] or end
-    if start > end:
+    # None when Taxila gave no open time and no open day -- the upsert then
+    # uses the day the bot first saw it. Copying the deadline here instead
+    # made start equal end: a zero-width window no hourly slot falls in, so
+    # the reminder could never fire.
+    start = rec["open"] or rec["open_day"]
+    if start is not None and start > end:
         start = end
     return start, end
 
@@ -635,9 +639,23 @@ def poll_teams_user(client: httpx.Client, url: str, start: datetime, end: dateti
 # ---------------------------------------------------------------------------
 
 
+# A start date Taxila did not supply arrives as None. First sight stores the
+# day the bot saw it (or the deadline, if that is earlier). Later polls keep
+# the stored start while it is still before the deadline, so a guess never
+# creeps forward one day per poll; a real date from Taxila always wins. A
+# stored start at or after the deadline -- rows written before this fix,
+# with start equal to end -- falls back to today, which heals them.
+_TODAY_IST = "(date_trunc('day', now() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata')"
+_KEPT_START = """COALESCE(%(start_date)s::timestamptz,
+                     CASE WHEN calendar.start_date < EXCLUDED.end_date
+                          THEN calendar.start_date
+                          ELSE EXCLUDED.start_date END)"""
+
+
 def upsert(conn: psycopg.Connection, rows: list[dict]) -> int:
     """Write calendar rows. echo_title is never touched -- once a row has
-    produced a reminder, that link survives every later poll."""
+    produced a reminder, that link survives every later poll. Unchanged
+    rows are skipped, so updated_at only moves on a real change."""
     if not rows:
         return 0
 
@@ -647,20 +665,23 @@ def upsert(conn: psycopg.Connection, rows: list[dict]) -> int:
             INSERT INTO calendar (event_key, source, event_type, subject_key,
                                   title, message, start_date, end_date)
             VALUES (%(event_key)s, %(source)s, %(event_type)s, %(subject_key)s,
-                    %(title)s, %(message)s, %(start_date)s, %(end_date)s)
+                    %(title)s, %(message)s,
+                    COALESCE(%(start_date)s::timestamptz,
+                             LEAST(""" + _TODAY_IST + """, %(end_date)s::timestamptz)),
+                    %(end_date)s)
             ON CONFLICT (event_key) DO UPDATE SET
                 event_type  = EXCLUDED.event_type,
                 subject_key = EXCLUDED.subject_key,
                 title       = EXCLUDED.title,
                 message     = EXCLUDED.message,
-                start_date  = EXCLUDED.start_date,
+                start_date  = """ + _KEPT_START + """,
                 end_date    = EXCLUDED.end_date,
                 updated_at  = now()
             WHERE (calendar.title, calendar.message,
                    calendar.start_date, calendar.end_date, calendar.subject_key)
                   IS DISTINCT FROM
                   (EXCLUDED.title, EXCLUDED.message,
-                   EXCLUDED.start_date, EXCLUDED.end_date, EXCLUDED.subject_key)
+                   """ + _KEPT_START + """, EXCLUDED.end_date, EXCLUDED.subject_key)
             """,
             rows,
         )
