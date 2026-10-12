@@ -66,7 +66,7 @@ MAIL_ENABLED = env_bool("MAIL_ENABLED", True)
 MAIL_SKIP_FORUM = env_bool("MAIL_SKIP_FORUM", False)
 MAIL_LOOKBACK_DAYS = int(os.environ.get("MAIL_LOOKBACK_DAYS", "2"))
 MAIL_MAX_PER_RUN = int(os.environ.get("MAIL_MAX_PER_RUN", "25"))
-MAIL_BODY_CHARS = int(os.environ.get("MAIL_BODY_CHARS", "4000"))
+MAIL_BODY_CHARS = int(os.environ.get("MAIL_BODY_CHARS", "7000"))
 MAIL_SUMMARY_CHARS = int(os.environ.get("MAIL_SUMMARY_CHARS", "900"))
 MAIL_LLM_DEADLINE_S = int(os.environ.get("MAIL_LLM_DEADLINE_S", "90"))
 
