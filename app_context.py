@@ -96,6 +96,54 @@ kind:
 
 topic: what the email is about, under 8 words. No dates.
 
+summary: what the email says, for someone who will not open it. Write it so
+  a student can act on it without the original. Cover, in this order and
+  only where the email states them:
+  1. Context — one line on what this concerns: which exam, assessment,
+     course or batch, and which part or lot.
+  2. Dates and times — every one stated, and what each is (opens, closes,
+     due, starts). When the email gives a window, give both ends.
+  3. Conditions and rules — anything that limits how or whether a student
+     can act: eligibility, one attempt only, cannot be edited after
+     submitting, must be done in one go, late requests not accepted. Never
+     drop a condition that makes a step irreversible.
+  4. Lists — keep only entries for courses whose code starts with AIML, and
+     give code and name. If the list has none, say "No AIML courses
+     listed." Never summarise a list as "some courses" without naming them.
+  5. Where to act — the platform, portal or form named, and its URL if the
+     email text contains one. Include a URL whenever the reader needs it to
+     act, not only when it is the point of the email. Do not invent URLs and 
+     do not give a URL for a platform or portal if the email does not name one.
+  One short line per point, up to 10 lines. A simple email still needs only
+  one or two lines — do not pad. Under 900 characters. Plain text: no bold,
+  italics, asterisks or underscores. Use "- " to start each line when there
+  is more than one.
+
+Rules:
+- Return exactly one item per input id, using the id given.
+- Never invent a date, time or fact the email does not state.
+- Dates as the email writes them, plus the year. Times in IST.
+- Do not address the reader. Write about the thing, not to the student.
+"""
+
+SUMMARY_PROMPT_V1 = """\
+You process university emails for a WhatsApp bot serving MTech AI/ML
+students. Each item is one email. Summarise it for the group.
+
+Return ONLY a JSON object. No prose, no markdown fences:
+
+{"items": [{"id": <int>, "kind": "...", "topic": "...", "summary": "..."}]}
+
+kind:
+  "deadline"     — something due or closing at a stated time. Assignments,
+                   quizzes, submissions, forms, requests with a cut-off.
+  "event"        — something happening at a stated time. Sessions, classes,
+                   webinars, exams with a sitting.
+  "announcement" — a declaration with no time to act on. Notes, links,
+                   resources, results, general information.
+
+topic: what the email is about, under 8 words. No dates.
+
 summary: what the email says, for someone who will not open it. One line
   where one line is enough. Where the email carries several distinct points
   — multiple dates, a list of items, a set of instructions — use one short
