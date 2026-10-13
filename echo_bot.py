@@ -17,10 +17,12 @@ call is billed time spent waiting on someone else's API:
 
     connect -> read staged work -> DISCONNECT
     (LLM calls, validation -- no database)
-    connect -> write updates, purge, select due, claim -> DISCONNECT
+    connect -> write updates, purge, select due + carried misses, claim -> DISCONNECT
     (webhooks -- no database)
+    connect -> mark what went through as delivered -> DISCONNECT
 
-Two connections when there is staged work, one when there is not.
+The first and last connections only open when there is staged work or
+something was sent; a quiet hour uses one.
 
 Dependencies: psycopg[binary], httpx. Nothing else -- no ORM, no SDK.
 """
@@ -80,7 +82,18 @@ LLM_TIMEOUT_S = int(os.environ.get("LLM_TIMEOUT_S", "60"))
 MAX_PENDING = int(os.environ.get("MAX_PENDING", "200"))
 
 SEND_TIMEOUT_S = float(os.environ.get("SEND_TIMEOUT_S", "30"))
+
+# Retries on a temporary send failure, within the same run. A cold-booted
+# Whatsmiau can spend 30s+ catching up on WhatsApp traffic it missed while
+# asleep, and Heroku's router cuts any request at 30s -- so the first send
+# fails while a second, a minute later, goes straight through. 0 turns it off.
+SEND_RETRIES = max(0, int(os.environ.get("SEND_RETRIES", "2")))
+SEND_RETRY_WAIT_S = float(os.environ.get("SEND_RETRY_WAIT_S", "45"))
 SENT_LOG_RETENTION_DAYS = int(os.environ.get("SENT_LOG_RETENTION_DAYS", "3"))
+
+# A reminder that still failed after every retry is carried into the next
+# runs for this many hours, then given up. 0 turns carrying off.
+REMINDER_CARRY_H = max(0, int(os.environ.get("REMINDER_CARRY_H", "3")))
 
 # Last-day boost: on a notice's final day, fire every N hours regardless of
 # its own schedule, because that is the day it matters. Nothing is written
@@ -226,7 +239,7 @@ def connect() -> psycopg.Connection:
         started = time.monotonic()
         try:
             conn = psycopg.connect(DATABASE_URL, connect_timeout=CONNECT_TIMEOUT_S)
-            log.info("connected in %.2fs", time.monotonic() - started)
+            log.info("db connected in %.2fs", time.monotonic() - started)
             return conn
         except psycopg.OperationalError as exc:
             if attempt == CONNECT_ATTEMPTS:
@@ -850,52 +863,131 @@ def select_and_claim(conn: psycopg.Connection) -> tuple[datetime, list[dict]]:
             r["by_boost"] = by_boost
             due.append(r)
     log.info("%d candidates, %d due after day rule", len(candidates), len(due))
-    if not due:
-        conn.commit()
-        return slot, []
 
     # Claim the whole batch in one statement, before sending anything. The
     # PK conflict is the guard: a row already claimed for this slot is not
-    # returned, so a duplicate or late run cannot resend it. Claiming first
-    # means a crash mid-run skips a slot rather than double-sending.
+    # returned, so a duplicate or late run cannot resend it.
+    #
+    # Claimed as undelivered; send() reports what went through and main()
+    # flips those. Anything left undelivered -- failed after retries,
+    # server down, run killed mid-send -- is picked up by owed() next run.
     #
     # created_by is part of the claim because it is part of the notice's
     # identity: two people in one group may each hold a reminder called
     # mlops-1, and one claiming the slot must not suppress the other.
+    claimed: set = set()
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO sent_log (target_group, echo_title, created_by,
-                                  target_date, target_hour)
-            SELECT g, t, c, %s, %s
-            FROM unnest(%s::text[], %s::text[], %s::text[]) AS u(g, t, c)
-            ON CONFLICT DO NOTHING
-            RETURNING target_group, echo_title, created_by
-            """,
-            (
-                target_date,
-                target_hour,
-                [r["target_group"] for r in due],
-                [r["echo_title"] for r in due],
-                [r["created_by"] for r in due],
-            ),
-        )
-        claimed = set(cur.fetchall())
+        if due:
+            cur.execute(
+                """
+                INSERT INTO sent_log (target_group, echo_title, created_by,
+                                      target_date, target_hour, delivered)
+                SELECT g, t, c, %s, %s, FALSE
+                FROM unnest(%s::text[], %s::text[], %s::text[]) AS u(g, t, c)
+                ON CONFLICT DO NOTHING
+                RETURNING target_group, echo_title, created_by
+                """,
+                (
+                    target_date,
+                    target_hour,
+                    [r["target_group"] for r in due],
+                    [r["echo_title"] for r in due],
+                    [r["created_by"] for r in due],
+                ),
+            )
+            claimed = set(cur.fetchall())
 
         cur.execute(
             "DELETE FROM sent_log WHERE sent_at < now() - make_interval(days => %s)",
             (SENT_LOG_RETENTION_DAYS,),
         )
-    conn.commit()
 
     if len(due) - len(claimed):
         log.info("%d already sent for this slot", len(due) - len(claimed))
 
-    return slot, [
-        r
-        for r in due
-        if (r["target_group"], r["echo_title"], r["created_by"]) in claimed
+    rows = []
+    for r in due:
+        if (r["target_group"], r["echo_title"], r["created_by"]) in claimed:
+            r["claim"] = (target_date, target_hour)
+            rows.append(r)
+
+    # Earlier misses go out after this slot's own reminders. One that is
+    # also due this slot is already in rows (or already claimed by another
+    # run) and is not sent twice.
+    this_slot = {(r["target_group"], r["echo_title"], r["created_by"]) for r in due}
+    carried = [
+        r for r in owed(conn, target_date, target_hour)
+        if (r["target_group"], r["echo_title"], r["created_by"]) not in this_slot
     ]
+    if carried:
+        log.info("carrying %d missed reminder(s)", len(carried))
+    conn.commit()
+    return slot, rows + carried
+
+
+def owed(conn: psycopg.Connection, target_date: date, target_hour: int) -> list[dict]:
+    """Reminders claimed in an earlier slot but never delivered.
+
+    A miss is carried only while it is still worth sending:
+      - claimed within REMINDER_CARRY_H hours;
+      - the notice still exists and its deadline has not passed -- this is
+        what drops a boost nudge for a deadline that is already over;
+      - no later slot of the same reminder has gone through since.
+    Several misses of one reminder collapse into one send, the latest.
+
+    The partial index on undelivered rows keeps this a near-empty scan on
+    every normal hour.
+    """
+    if not REMINDER_CARRY_H:
+        return []
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (l.target_group, l.echo_title, l.created_by)
+                   l.target_group, l.echo_title, l.created_by,
+                   l.target_date, l.target_hour,
+                   s.last_updated_by, s.subject_key, s.message, s.end_date
+            FROM sent_log l
+            JOIN src_notice s USING (target_group, echo_title, created_by)
+            WHERE NOT l.delivered
+              AND l.sent_at > now() - make_interval(hours => %s)
+              AND (l.target_date, l.target_hour) <> (%s, %s)
+              AND s.end_date > now()
+              AND NOT EXISTS (
+                  SELECT 1 FROM sent_log d
+                  WHERE d.target_group = l.target_group
+                    AND d.echo_title   = l.echo_title
+                    AND d.created_by   = l.created_by
+                    AND d.delivered
+                    AND (d.target_date, d.target_hour) > (l.target_date, l.target_hour)
+              )
+            ORDER BY l.target_group, l.echo_title, l.created_by,
+                     l.target_date DESC, l.target_hour DESC
+            """,
+            (REMINDER_CARRY_H, target_date, target_hour),
+        )
+        rows = cur.fetchall()
+    for r in rows:
+        # No quip: the slot that earned it has passed.
+        r["by_boost"] = False
+        r["claim"] = (r.pop("target_date"), r.pop("target_hour"))
+    return rows
+
+
+def mark_delivered(conn: psycopg.Connection, delivered: list[tuple]) -> None:
+    """Flip the claims that went through. One statement for the batch."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE sent_log l SET delivered = TRUE
+            FROM unnest(%s::text[], %s::text[], %s::text[], %s::date[], %s::int[])
+                 AS u(g, t, c, d, h)
+            WHERE (l.target_group, l.echo_title, l.created_by,
+                   l.target_date, l.target_hour) = (u.g, u.t, u.c, u.d, u.h)
+            """,
+            [list(col) for col in zip(*delivered)],
+        )
+    conn.commit()
 
 
 def _jid_suffix(jid: str) -> str:
@@ -915,7 +1007,7 @@ def _jid_suffix(jid: str) -> str:
 # text and keys. Only Whatsmiau's own error message field is kept, masked.
 # ---------------------------------------------------------------------------
 
-_RUN = {"cold_boot": False, "sends": 0}
+_RUN = {"cold_boot": False, "sends": 0, "retries_spent": False}
 
 
 def send_attempt() -> str:
@@ -995,6 +1087,59 @@ def log_send(ident: str, elapsed: float, tags: str, r: httpx.Response | None = N
               what, elapsed, cause, suffix, ident,
               (" · server said: " + detail) if detail else "")
     return False
+
+
+def retryable(status: int) -> bool:
+    """Worth trying again: server trouble, router timeout, rate limiting."""
+    return status >= 500 or status == 429
+
+
+def post_with_retry(client: httpx.Client, path: str, payload: dict, ident: str):
+    """POST one message, retrying temporary failures. Returns (ok, response,
+    exception) from the last attempt; response is None when the request
+    never got an answer.
+
+    Temporary means a timeout, a connection error, a 5xx or a 429. Anything
+    else -- a 400 bad number, a 401 wrong key -- fails at once; retrying
+    would not change it.
+
+    One retry budget per run. If a message fails every attempt, Whatsmiau
+    is down rather than slow, so later messages in the run get a single
+    attempt each instead of three -- a bad hour costs one message's worth
+    of waiting, not one per message.
+
+    A timed-out attempt is sometimes delivered late, so a retry can post a
+    message twice. Accepted: a duplicate beats a lost reminder.
+    """
+    tags = send_attempt()
+    attempts = 1 if _RUN["retries_spent"] else 1 + SEND_RETRIES
+    r = exc = None
+
+    for n in range(1, attempts + 1):
+        label = tags if n == 1 else ("cold boot" if _RUN["cold_boot"] else "")
+        if attempts > 1:
+            label = (label + " · " if label else "") + "attempt %d/%d" % (n, attempts)
+        started = time.monotonic()
+        try:
+            r, exc = client.post(path, json=payload), None
+        except httpx.HTTPError as e:
+            r, exc = None, e
+        ok = log_send(ident, time.monotonic() - started, label, r=r, exc=exc)
+        if ok:
+            return True, r, None
+
+        temporary = isinstance(exc, httpx.TransportError) or (
+            r is not None and retryable(r.status_code))
+        if not temporary:
+            return False, r, exc
+        if n < attempts:
+            log.info("%s retrying in %.0fs", ident, SEND_RETRY_WAIT_S)
+            time.sleep(SEND_RETRY_WAIT_S)
+
+    if attempts > 1:
+        _RUN["retries_spent"] = True
+        log.warning("%s failed all %d attempts -- no more retries this run", ident, attempts)
+    return False, r, exc
 
 
 def wake_ping() -> None:
@@ -1167,13 +1312,15 @@ def quip_for(seed: str) -> str:
         return ""
 
 
-def send(slot: datetime, rows: list[dict]) -> None:
+def send(slot: datetime, rows: list[dict]) -> list[tuple]:
     """Send the reminders. Runs with no database connection.
 
     One client for the batch, so TCP and TLS are reused across sends.
+    Returns the sent_log claims that went through, for mark_delivered.
     """
+    delivered: list[tuple] = []
     if not rows:
-        return
+        return delivered
 
     sent = failed = 0
     # print("API_URL",API_URL)
@@ -1204,24 +1351,24 @@ def send(slot: datetime, rows: list[dict]) -> None:
             else:
                 text = "%s\n\n%s" % ("📢📅⏰ — Scheduled reminder", text)
             ident = "echo_title=%s jid_suffix=%s" % (row["echo_title"], _jid_suffix(jid))
-            tags = send_attempt()
-            started = time.monotonic()
-            try:
-                r = client.post(
-                    "/message/sendText/" + INSTANCE,
-                    json={"number": jid, "text": text, "mentioned":[requestor], "mentionsEveryOne": MENTIONS_EVERY_ONE},
-                )
-                ok = log_send(ident, time.monotonic() - started, tags, r=r)
-            except httpx.HTTPError as exc:
-                # Claim stays. This slot is lost; the next scheduled hour
-                # for this notice fires normally.
-                ok = log_send(ident, time.monotonic() - started, tags, exc=exc)
+            if row["claim"] != (slot.date(), slot.hour):
+                ident += " carried_from=%s_%02d" % row["claim"]
+            # A failure after every retry leaves the claim undelivered, so
+            # the next run carries it -- see owed().
+            ok, _, _ = post_with_retry(
+                client, "/message/sendText/" + INSTANCE,
+                {"number": jid, "text": text, "mentioned":[requestor], "mentionsEveryOne": MENTIONS_EVERY_ONE}, ident,
+            )
             if ok:
                 sent += 1
+                delivered.append(
+                    (jid, row["echo_title"], row["created_by"]) + row["claim"]
+                )
             else:
                 failed += 1
 
     log.info("sent %d, failed %d", sent, failed)
+    return delivered
 
 
 # ---------------------------------------------------------------------------
@@ -1253,9 +1400,7 @@ def main() -> int:
         except Exception:
             log.exception("update resolution failed, continuing to dispatch")
 
-    # Phase 3: health check, still with no connection held. Done before
-    # claiming so that a dead server means no claim -- otherwise sent_log
-    # would record sends that never happened.
+    # Phase 3: health check, still with no connection held.
     healthy = wait_healthy()
 
     # Phase 4: all remaining database work on one connection.
@@ -1271,16 +1416,32 @@ def main() -> int:
 
         purge_expired(conn)
 
-        if healthy:
-            slot, to_send = select_and_claim(conn)
-        else:
-            log.error("skipping dispatch: whatsmiau unreachable")
+        # Claimed even when the server is down: the claims stay
+        # undelivered, so the next run carries them instead of losing them.
+        slot, to_send = select_and_claim(conn)
+        if not healthy and to_send:
+            log.error("skipping %d send(s): whatsmiau unreachable, carried to next run",
+                      len(to_send))
+            to_send = []
     finally:
         conn.close()
         db_time += time.monotonic() - t
 
     # Phase 5: sends, no connection held.
-    send(slot, to_send)
+    delivered = send(slot, to_send)
+
+    # Phase 6: record what went through. Only opens a connection when
+    # something was sent; a quiet hour costs nothing.
+    if delivered:
+        t = time.monotonic()
+        conn = connect()
+        try:
+            mark_delivered(conn, delivered)
+        except Exception:
+            log.exception("could not mark %d send(s) delivered", len(delivered))
+        finally:
+            conn.close()
+            db_time += time.monotonic() - t
 
     total = time.monotonic() - started
     log.info("run finished in %.1fs (%.1fs connected)", total, db_time)
