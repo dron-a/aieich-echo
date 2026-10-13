@@ -83,11 +83,19 @@ CREATE TABLE IF NOT EXISTS sent_log (
     target_date  DATE     NOT NULL,
     target_hour  SMALLINT NOT NULL,
     sent_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- FALSE from claim until the send goes through. A row left FALSE is a
+    -- miss, carried into the next runs for REMINDER_CARRY_H hours.
+    delivered    BOOLEAN  NOT NULL DEFAULT TRUE,
     -- created_by is in the key so that two same-titled reminders in one
     -- group claim their slot independently; without it one would suppress
     -- the other and only one person's reminder would ever send.
     PRIMARY KEY (target_group, echo_title, created_by, target_date, target_hour)
 );
+
+-- Existing databases: ALTER TABLE sent_log ADD COLUMN IF NOT EXISTS
+--     delivered BOOLEAN NOT NULL DEFAULT TRUE;
+-- Holds only the handful of undelivered rows, so the carry check is free.
+CREATE INDEX IF NOT EXISTS sent_log_owed_idx ON sent_log (sent_at) WHERE NOT delivered;
 
 -- Upstream stage_update must reset processed on conflict, or a re-staged
 -- update to an already-processed row is never picked up:

@@ -45,9 +45,9 @@ from echo_bot import (
     call_llm,
     connect,
     env_bool,
-    log_send,
     parse_response,
-    send_attempt,
+    post_with_retry,
+    retryable,
 )
 
 log = logging.getLogger("mail_bot")
@@ -389,11 +389,6 @@ def calendar_rows(mails: list[dict], items: dict[int, dict]) -> list[dict]:
     return rows
 
 
-def _retryable(status: int) -> bool:
-    """Worth trying again next run: server trouble or rate limiting."""
-    return status >= 500 or status == 429
-
-
 def notify(mails: list[dict], items: dict[int, dict]) -> tuple[int, int]:
     """Post one message per summarised mail, in uid order.
 
@@ -432,21 +427,15 @@ def notify(mails: list[dict], items: dict[int, dict]) -> tuple[int, int]:
             else:
                 text = "%s\n\n%s" % ("📬🔔 — New mail alert", text)
             ident = "mail uid=%d" % mail["uid"]
-            tags = send_attempt()
-            started = time.monotonic()
-            try:
-                r = client.post(
-                    "/message/sendText/" + INSTANCE,
-                    json={"number": MAIL_TARGET_GROUP, "text": text, "mentionsEveryOne": MENTIONS_EVERY_ONE},
-                )
-            except httpx.TransportError as exc:
-                log_send(ident, time.monotonic() - started, tags, exc=exc)
-                log.info("mail uid=%d held for retry next run", mail["uid"])
-                return sent, done
-
-            if log_send(ident, time.monotonic() - started, tags, r=r):
+            ok, r, exc = post_with_retry(
+                client, "/message/sendText/" + INSTANCE,
+                {"number": MAIL_TARGET_GROUP, "text": text, "mentionsEveryOne": MENTIONS_EVERY_ONE}, ident,
+            )
+            if ok:
                 sent += 1
-            elif _retryable(r.status_code):
+            elif r is None or retryable(r.status_code):
+                # Still failing after the in-run retries: hold it, and
+                # everything after it, for the next run.
                 log.info("mail uid=%d held for retry next run", mail["uid"])
                 return sent, done
             else:

@@ -60,8 +60,8 @@ from echo_bot import (
     SEND_TIMEOUT_S,
     connect,
     env_bool,
-    log_send,
-    send_attempt,
+    post_with_retry,
+    retryable,
 )
 from group_bot import is_section
 from mail_bot import MAIL_TARGET_GROUP, SUBJECT_NAMES, summarise
@@ -339,10 +339,6 @@ def calendar_row(post: dict, course: dict) -> dict:
     }
 
 
-def _retryable(status: int) -> bool:
-    return status >= 500 or status == 429
-
-
 def send(messages: list[tuple[dict, str]]) -> list[dict]:
     """Send in order; return the posts that are finished.
 
@@ -359,18 +355,13 @@ def send(messages: list[tuple[dict, str]]) -> list[dict]:
             else:
                 text = "%s\n\n%s" % ("🏫📢 Taxila Announcement", text)
             ident = "forum d=%d" % post["discussion"]
-            tags = send_attempt()
-            started = time.monotonic()
-            try:
-                r = client.post("/message/sendText/" + INSTANCE,
-                                json={"number": MAIL_TARGET_GROUP, "text": text, "mentionsEveryOne": MENTIONS_EVERY_ONE})
-            except httpx.TransportError as exc:
-                log_send(ident, time.monotonic() - started, tags, exc=exc)
-                log.info("forum d=%d held for retry next run", post["discussion"])
-                break
-            if log_send(ident, time.monotonic() - started, tags, r=r):
+            ok, r, exc = post_with_retry(
+                client, "/message/sendText/" + INSTANCE,
+                {"number": MAIL_TARGET_GROUP, "text": text, "mentionsEveryOne": MENTIONS_EVERY_ONE}, ident,
+            )
+            if ok:
                 done.append(post)
-            elif _retryable(r.status_code):
+            elif r is None or retryable(r.status_code):
                 log.info("forum d=%d held for retry next run", post["discussion"])
                 break
             else:
