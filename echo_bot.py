@@ -169,9 +169,32 @@ BOOST_BANDS_RAW = os.environ.get("BOOST_BANDS", "12:6,4:3,0:1")
 # QUIP_LLM_CHANCE is the probability of asking a model for a fresh line
 # instead of using the static list. 0 disables the LLM path entirely.
 QUIPS_ENABLED = env_bool("QUIPS_ENABLED", True)
-QUIP_LLM_CHANCE = float(os.environ.get("QUIP_LLM_CHANCE", "0.3"))
-QUIP_TIMEOUT_S = float(os.environ.get("QUIP_TIMEOUT_S", "8"))
+QUIP_LLM_CHANCE = float(os.environ.get("QUIP_LLM_CHANCE", "1.0"))
+QUIP_TIMEOUT_S = float(os.environ.get("QUIP_TIMEOUT_S", "10"))
 QUIP_MAX_CHARS = int(os.environ.get("QUIP_MAX_CHARS", "120"))
+
+# Voice of every LLM quip. Change it in config without a deploy.
+QUIP_TONE = os.environ.get(
+    "QUIP_TONE",
+    "mostly humble and sharp, with a little sass and sarcasm; "
+    "AI vs humans is a welcome angle",
+).strip()
+
+# One style is picked at random for each LLM quip, so lines vary in angle
+# rather than drifting to the same joke. Override with QUIP_FLAVOURS,
+# entries separated by |.
+QUIP_FLAVOURS = [
+    f.strip()
+    for f in os.environ.get(
+        "QUIP_FLAVOURS",
+        "ML jargon used as life advice"
+        "|a fake training-log line"
+        "|a Bollywood dialogue, twisted"
+        "|a corporate standup update"
+        "|an exam-hall jugaad observation",
+    ).split("|")
+    if f.strip()
+]
 
 # The Whatsmiau server runs on an Eco dyno and is probably asleep. The wake
 # ping is fired before anything else so it boots while this bot does its
@@ -1244,6 +1267,12 @@ def _static_quip(seed: str) -> str:
     return QUIPS[idx]
 
 
+def _quip_ask() -> str:
+    if not QUIP_FLAVOURS:
+        return "Deadline today, we need a clever quip, make it count!"
+    return "Style: %s. Deadline today, we need a clever quip, make it count!" % random.choice(QUIP_FLAVOURS)
+
+
 def _llm_quip() -> str:
     """One short attempt at a fresh line. No failover, no retries.
 
@@ -1268,12 +1297,13 @@ def _llm_quip() -> str:
                         "content": (
                             "You write a single dry one-liner nudging Indian "
                             "MTech AI/ML students about a deadline for any task that falls "
-                            "today. Under 120 characters. Wry, never cruel. "
-                            "No emoji, no quotes, no markdown. Output the line "
+                            "today. Under 120 characters."
+                            + ("Tone: %s. " % QUIP_TONE if QUIP_TONE else "")
+                            "Wry, never cruel. No emoji, no quotes, no markdown. Output the line "
                             "only."
                         ),
                     },
-                    {"role": "user", "content": "Deadline today, we need a clever quip, make it count!"},
+                    {"role": "user", "content": _quip_ask()},
                 ],
             },
             timeout=QUIP_TIMEOUT_S,
