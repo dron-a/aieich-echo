@@ -47,7 +47,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from app_context import SUBJECT_CONTEXT, BOT_CONTEXT
+from app_context import SUBJECT_CONTEXT, BOT_CONTEXT, FULL_WITTY_MSG_CONTEXT
 
 def env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -196,6 +196,17 @@ QUIP_FLAVOURS = [
     if f.strip()
 ]
 
+# full quip context
+COUNTDOWN_DAYS = {
+    int(d) for d in os.environ.get("COUNTDOWN_DAYS", "5,3,1,0").split(",") if d.strip()
+}
+COUNTDOWN_MAX = max(COUNTDOWN_DAYS, default=None)
+FULL_WITTY_MSG_TEMPERATURE = float(os.environ.get("FULL_WITTY_MSG_TEMPERATURE", "0.9"))
+WITTY_TONE = os.environ.get(
+    "WITTY_TONE",
+    "mostly humble and sharp, with a little sass and sarcasm; "
+    "AI vs humans is a welcome angle",
+).strip()
 # The Whatsmiau server runs on an Eco dyno and is probably asleep. The wake
 # ping is fired before anything else so it boots while this bot does its
 # database and LLM work; the health check then usually finds it already up.
@@ -538,6 +549,80 @@ def validate(changes: object, current: dict) -> dict:
 
     return clean
 
+
+# ---------------------------------------------------------------------------
+# Extra -- check for remaining days from deadline of a slot
+# ---------------------------------------------------------------------------
+def days_left(end_date: datetime, slot: datetime) -> int:
+    return (end_date.astimezone(IST).date() - slot.date()).days
+
+def _full_witty_msg(message: str, msg_type: str = "deadline") -> str:
+    """Complete message is a witty message, experimental feature"""
+    flavour = random.choice(QUIP_FLAVOURS) if QUIP_FLAVOURS else "Choose wisely based on Tone and Subject Context"
+    for p in PROVIDERS:
+        key = os.environ.get(p.key_env)
+        usr_msg = f"""Type: {msg_type}
+                Flavour: {flavour}
+                
+                Message:
+                <<<
+                {message}
+                >>>"""
+        if not key:
+            continue
+        r = httpx.post(
+            p.base_url + "/chat/completions",
+            headers={"Authorization": "Bearer " + key},
+            json={
+                "model": p.model,
+                "temperature": FULL_WITTY_MSG_TEMPERATURE,
+                "max_tokens": 60,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": FULL_WITTY_MSG_CONTEXT.replace("{tone}", WITTY_TONE).replace("{subject_context}", SUBJECT_CONTEXT)
+                    },
+                    {"role": "user", "content": usr_msg},
+                ],
+            },
+            timeout=QUIP_TIMEOUT_S,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    return ""
+
+
+def gen_witty_msg(msg: str) -> str:
+    """Generates Witty message for the given message. Returns empty string if witty generation fails or is disabled."""
+    if not QUIPS_ENABLED:
+        return msg
+
+    try:
+        if QUIP_LLM_CHANCE > 0 and random.random() < QUIP_LLM_CHANCE:
+            try:
+                llm_resp = _full_witty_msg(message=msg)
+
+                text = (llm_resp or "").strip()
+
+                # Unwrap only when the whole reply is in quotes.
+                if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+                    text = text[1:-1].strip()
+
+                # Reject anything that would look wrong in a group chat.
+                if not text or len(text) > len(msg) + 500:
+                    log.info("witty rewrite rejected, using static")
+                    return msg
+                log.info("llm quipped full msg")
+                return text
+            except Exception as exc:
+                log.info("witty rewrite failed (%s), sending original", type(exc).__name__)
+                return msg
+        log.info("returning static message")
+        return msg
+    except Exception:
+        # Cosmetic feature. Never let it affect a reminder.
+        log.warning("witty rewrite failed, sending original msg", exc_info=True)
+        return msg
 
 # ---------------------------------------------------------------------------
 # Step 1 -- apply staged updates
@@ -1298,7 +1383,7 @@ def _llm_quip() -> str:
                             "You write a single dry one-liner nudging Indian "
                             "MTech AI/ML students about a deadline for any task that falls "
                             "today. Under 120 characters."
-                            + ("Tone: %s. " % QUIP_TONE if QUIP_TONE else "")
+                            + ("Tone: %s. " % QUIP_TONE if QUIP_TONE else "") +
                             "Wry, never cruel. No emoji, no quotes, no markdown. Output the line "
                             "only."
                         ),
@@ -1374,6 +1459,8 @@ def send(slot: datetime, rows: list[dict]) -> list[tuple]:
             text = "*%s*\n%s" % (row["echo_title"], row["message"])
             if quip and row.get("by_boost"):
                 text = "%s\n%s" % (quip, text)
+            elif COUNTDOWN_MAX is not None and max(days_left(row["end_date"], slot),0) <= COUNTDOWN_MAX:
+                text = "*%s*\n%s" % (row["echo_title"], gen_witty_msg(row["message"]))
             if MENTIONS_EVERY_ONE:
                 if row["created_by"] != 'echo_cal':
                     requestor = str(row["created_by"])
