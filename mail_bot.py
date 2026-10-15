@@ -67,7 +67,7 @@ MAIL_SKIP_FORUM = env_bool("MAIL_SKIP_FORUM", False)
 MAIL_LOOKBACK_DAYS = int(os.environ.get("MAIL_LOOKBACK_DAYS", "2"))
 MAIL_MAX_PER_RUN = int(os.environ.get("MAIL_MAX_PER_RUN", "25"))
 MAIL_BODY_CHARS = int(os.environ.get("MAIL_BODY_CHARS", "7000"))
-MAIL_SUMMARY_CHARS = int(os.environ.get("MAIL_SUMMARY_CHARS", "900"))
+MAIL_SUMMARY_CHARS = int(os.environ.get("MAIL_SUMMARY_CHARS", "1000"))
 MAIL_LLM_DEADLINE_S = int(os.environ.get("MAIL_LLM_DEADLINE_S", "90"))
 
 # Course code as stored in src_notice.subject_key -- the AIML part only.
@@ -278,7 +278,7 @@ def summarise(mails: list[dict]) -> dict[int, dict]:
     payload = json.dumps(
         {
             "items": [
-                {"id": i, "subject": m["subject"], "body": m["body"]}
+                {"id": i, "source": m.get("source", "mail"), "subject": m["subject"], "body": m["body"]}
                 for i, m in enumerate(mails, 1)
             ]
         },

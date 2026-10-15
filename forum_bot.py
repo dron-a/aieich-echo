@@ -484,6 +484,7 @@ def main() -> int:
     # so the whole batch is retried next run.
     batch = [
         {
+            "source": "forum",
             "subject": html.unescape(p.get("subject") or ""),
             "body": to_text(p.get("message"))
             + ("\n\nAttached files: " + ", ".join(n for n, _ in attachments(p))
