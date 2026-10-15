@@ -47,7 +47,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from app_context import SUBJECT_CONTEXT, BOT_CONTEXT, FULL_WITTY_MSG_CONTEXT
+from app_context import SUBJECT_CONTEXT, BOT_CONTEXT, SUBJECT_NAMES, QUIP_CTX_PROMPT
 
 def env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -202,11 +202,7 @@ COUNTDOWN_DAYS = {
 }
 COUNTDOWN_MAX = max(COUNTDOWN_DAYS, default=None)
 FULL_WITTY_MSG_TEMPERATURE = float(os.environ.get("FULL_WITTY_MSG_TEMPERATURE", "0.9"))
-WITTY_TONE = os.environ.get(
-    "WITTY_TONE",
-    "mostly humble and sharp, with a little sass and sarcasm; "
-    "AI vs humans is a welcome angle",
-).strip()
+QUIP_BUDGET_S = float(os.environ.get("QUIP_BUDGET_S", "30"))
 # The Whatsmiau server runs on an Eco dyno and is probably asleep. The wake
 # ping is fired before anything else so it boots while this bot does its
 # database and LLM work; the health check then usually finds it already up.
@@ -556,73 +552,71 @@ def validate(changes: object, current: dict) -> dict:
 def days_left(end_date: datetime, slot: datetime) -> int:
     return (end_date.astimezone(IST).date() - slot.date()).days
 
-def _full_witty_msg(message: str, msg_type: str = "deadline") -> str:
-    """Complete message is a witty message, experimental feature"""
-    flavour = random.choice(QUIP_FLAVOURS) if QUIP_FLAVOURS else "Choose wisely based on Tone and Subject Context"
-    for p in PROVIDERS:
-        key = os.environ.get(p.key_env)
-        usr_msg = f"""Type: {msg_type}
-                Flavour: {flavour}
-                
-                Message:
-                <<<
-                {message}
-                >>>"""
-        if not key:
-            continue
+def prompt_times(n_days: int | None, slot: datetime | None) -> tuple[str, str]:
+    if slot is None:
+        slot = datetime.now(IST)
+    now = slot.strftime("%a %d %b %Y, %H:%M IST")          # Thu 15 Oct 2026, 21:00 IST
+
+    if n_days is None:
+        return now, "unknown"
+
+    if n_days == 0:
+        left = "today"
+    elif n_days == 1:
+        left = "tomorrow"
+    else:
+        left = "%d days" % n_days
+    return now, left
+
+def context_quip(text: str, msg_type: str, subject_key: str | None,
+                 slot: datetime | None, n_days: int | None, quip_left: list[float]) -> str:
+    """One witty line for this notification, or "" -- never raises."""
+    if quip_left[0] <= 0:
+        return ""
+    started = time.monotonic()
+    try:
+        p = next((p for p in PROVIDERS if os.environ.get(p.key_env)), None)
+        if p is None:
+            return ""
+
+        now, left = prompt_times(n_days, slot)
+        usr_msg = "\n".join([
+            "Type: %s" % msg_type,
+            "Subject: %s" % SUBJECT_NAMES.get((subject_key or "").upper(), subject_key or "BITS_WILP"),
+            "Now: %s" % now,
+            "Time left: %s" % left,
+            "Flavour: %s" % (random.choice(QUIP_FLAVOURS) if QUIP_FLAVOURS else "your choice, can choose based on tone"),
+            "Text: <<< %s >>>" % text,
+        ])
+
         r = httpx.post(
             p.base_url + "/chat/completions",
-            headers={"Authorization": "Bearer " + key},
+            headers={"Authorization": "Bearer " + os.environ[p.key_env]},
             json={
                 "model": p.model,
-                "temperature": FULL_WITTY_MSG_TEMPERATURE,
+                "temperature": 0.9,
                 "max_tokens": 60,
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": FULL_WITTY_MSG_CONTEXT.replace("{tone}", WITTY_TONE).replace("{subject_context}", SUBJECT_CONTEXT)
-                    },
+                    {"role": "system", "content": QUIP_CTX_PROMPT.replace("{tone}", QUIP_TONE or "wry")},
                     {"role": "user", "content": usr_msg},
                 ],
             },
-            timeout=QUIP_TIMEOUT_S,
+            timeout=min(QUIP_TIMEOUT_S, max(1.0, quip_left[0])),
         )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-    return ""
 
-
-def gen_witty_msg(msg: str) -> str:
-    """Generates Witty message for the given message. Returns empty string if witty generation fails or is disabled."""
-    if not QUIPS_ENABLED:
-        return msg
-
-    try:
-        if QUIP_LLM_CHANCE > 0 and random.random() < QUIP_LLM_CHANCE:
-            try:
-                llm_resp = _full_witty_msg(message=msg)
-
-                text = (llm_resp or "").strip()
-
-                # Unwrap only when the whole reply is in quotes.
-                if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
-                    text = text[1:-1].strip()
-
-                # Reject anything that would look wrong in a group chat.
-                if not text or len(text) > len(msg) + 500:
-                    log.info("witty rewrite rejected, using static")
-                    return msg
-                log.info("llm quipped full msg")
-                return text
-            except Exception as exc:
-                log.info("witty rewrite failed (%s), sending original", type(exc).__name__)
-                return msg
-        log.info("returning static message")
-        return msg
-    except Exception:
-        # Cosmetic feature. Never let it affect a reminder.
-        log.warning("witty rewrite failed, sending original msg", exc_info=True)
-        return msg
+        line = (r.json()["choices"][0]["message"]["content"] or "").strip()
+        if len(line) >= 2 and line[0] == line[-1] and line[0] in "\"'":
+            line = line[1:-1].strip()
+        if (not line or line.upper() == "SKIP" or "\n" in line
+                or len(line) > QUIP_MAX_CHARS or any(c.isdigit() for c in line)):
+            return ""
+        return line
+    except Exception as exc:
+        log.info("context quip skipped (%s)", type(exc).__name__)
+        return ""
+    finally:
+        quip_left[0] -= time.monotonic() - started
 
 # ---------------------------------------------------------------------------
 # Step 1 -- apply staged updates
@@ -1450,6 +1444,7 @@ def send(slot: datetime, rows: list[dict]) -> list[tuple]:
         headers={"apikey": API_KEY},
         timeout=SEND_TIMEOUT_S,
     ) as client:
+        quip_left = [QUIP_BUDGET_S]
         for row in rows:
             jid = row["target_group"]
             requestor = "all"
@@ -1457,10 +1452,12 @@ def send(slot: datetime, rows: list[dict]) -> list[tuple]:
             # update or remove the reminder, so it needs to be visible
             # without competing with the reminder itself.
             text = "*%s*\n%s" % (row["echo_title"], row["message"])
+            dl = max(days_left(row["end_date"], slot),0)
             if quip and row.get("by_boost"):
                 text = "%s\n%s" % (quip, text)
-            elif COUNTDOWN_MAX is not None and max(days_left(row["end_date"], slot),0) <= COUNTDOWN_MAX:
-                text = "*%s*\n%s" % (row["echo_title"], gen_witty_msg(row["message"]))
+            elif COUNTDOWN_MAX is not None and dl <= COUNTDOWN_MAX:
+                full_msg_quip = context_quip(text=row["message"], msg_type = 'deadline', subject_key=row.get("subject_key"), slot=slot, days_left=dl, quip_left=quip_left)
+                text = "%s\n%s" % (full_msg_quip, text) if len(full_msg_quip) > 0 else text
             if MENTIONS_EVERY_ONE:
                 if row["created_by"] != 'echo_cal':
                     requestor = str(row["created_by"])
