@@ -1456,7 +1456,7 @@ def send(slot: datetime, rows: list[dict]) -> list[tuple]:
             if quip and row.get("by_boost"):
                 text = "%s\n%s" % (quip, text)
             elif COUNTDOWN_MAX is not None and dl <= COUNTDOWN_MAX:
-                full_msg_quip = context_quip(text=row["message"], msg_type = 'deadline', subject_key=row.get("subject_key"), slot=slot, days_left=dl, quip_left=quip_left)
+                full_msg_quip = context_quip(text=row["message"], msg_type = 'deadline', subject_key=row.get("subject_key"), slot=slot, n_days=dl, quip_left=quip_left)
                 text = "%s\n%s" % (full_msg_quip, text) if len(full_msg_quip) > 0 else text
             if MENTIONS_EVERY_ONE:
                 if row["created_by"] != 'echo_cal':
