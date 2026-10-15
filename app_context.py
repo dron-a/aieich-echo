@@ -157,6 +157,8 @@ summary: what the item says, for someone who will not open it. Write it so
 
 RULES
 - Return exactly one item per input id, using the id given.
+- Summarise each item independently, as if it were the only one. The number
+  of items never changes how long or detailed any summary is.
 - Never invent a date, time or fact the item does not state.
 - Never state that something is absent, except as point 4 requires.
 - Dates as the item writes them, plus the year. Times in IST.
