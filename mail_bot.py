@@ -42,6 +42,7 @@ from echo_bot import (
     INSTANCE,
     IST,
     SEND_TIMEOUT_S,
+    SUMMARY_TEMPERATURE,
     call_llm,
     connect,
     env_bool,
@@ -291,6 +292,7 @@ def summarise(mails: list[dict]) -> dict[int, dict]:
         payload,
         time.monotonic() + MAIL_LLM_DEADLINE_S,
         system_prompt=SUMMARY_PROMPT,
+        temperature=SUMMARY_TEMPERATURE,
     )
     parsed = parse_response(raw, key="items")
 

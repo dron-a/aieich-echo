@@ -83,6 +83,12 @@ MAX_PENDING = int(os.environ.get("MAX_PENDING", "200"))
 
 SEND_TIMEOUT_S = float(os.environ.get("SEND_TIMEOUT_S", "30"))
 
+# Sampling temperature per use. Reminder updates are strict JSON edits, so
+# they stay at 0 unless changed. Summaries default to 1.0: Google advises
+# keeping Gemini 3 at its default of 1.0, and at 0 it drops detail.
+PATCH_TEMPERATURE = float(os.environ.get("PATCH_TEMPERATURE", "0"))
+SUMMARY_TEMPERATURE = float(os.environ.get("SUMMARY_TEMPERATURE", "1.0"))
+
 # Retries on a temporary send failure, within the same run. A cold-booted
 # Whatsmiau can spend 30s+ catching up on WhatsApp traffic it missed while
 # asleep, and Heroku's router cuts any request at 30s -- so the first send
@@ -359,11 +365,13 @@ def patch_prompt() -> str:
     )
 
 
-def call_llm(payload: str, deadline: float, system_prompt: str | None = None) -> str:
+def call_llm(payload: str, deadline: float, system_prompt: str | None = None,
+             temperature: float | None = None) -> str:
     """POST to the first provider that answers. Raises when all fail.
 
     system_prompt defaults to the reminder-patch prompt built below; the
-    mail bot passes its own.
+    mail bot passes its own. temperature defaults to PATCH_TEMPERATURE;
+    the mail bot passes SUMMARY_TEMPERATURE.
     """
     last = "no provider configured"
 
@@ -377,7 +385,7 @@ def call_llm(payload: str, deadline: float, system_prompt: str | None = None) ->
 
         body = {
             "model": p.model,
-            "temperature": 0,
+            "temperature": PATCH_TEMPERATURE if temperature is None else temperature,
             "max_tokens": 4000,
             "messages": [
                 {"role": "system", "content": system_prompt or patch_prompt()},
