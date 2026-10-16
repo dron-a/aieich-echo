@@ -1420,7 +1420,8 @@ def quip_for(seed: str) -> str:
                     return text
                 log.info("llm quip rejected, using static")
             except Exception as exc:
-                log.info("llm quip unavailable (%s), using static", type(exc).__name__)
+                code = getattr(getattr(exc, "response", None), "status_code", "")
+                log.info("llm quip unavailable (%s), using static", type(exc).__name__, code)
         log.info("static quipped")
         return _static_quip(seed)
     except Exception:
@@ -1461,11 +1462,19 @@ def send(slot: datetime, rows: list[dict]) -> list[tuple]:
             # without competing with the reminder itself.
             text = "*%s*\n%s" % (row["echo_title"], row["message"])
             dl = max(days_left(row["end_date"], slot),0)
-            if quip and row.get("by_boost"):
-                text = "%s\n%s" % (quip, text)
-            elif COUNTDOWN_MAX is not None and dl <= COUNTDOWN_MAX:
-                full_msg_quip = context_quip(text=row["message"], msg_type = 'deadline', subject_key=row.get("subject_key"), slot=slot, n_days=dl, quip_left=quip_left)
-                text = "%s\n%s" % (full_msg_quip, text) if len(full_msg_quip) > 0 else text
+
+            # Context quip first; the generic quip only fills in for boost sends.
+            q = ""
+            if COUNTDOWN_MAX is not None and dl <= COUNTDOWN_MAX:
+                q = context_quip(text=row["message"], msg_type="deadline",
+                                subject_key=row.get("subject_key"), slot=slot,
+                                n_days=dl, quip_left=quip_left)
+                log.info("context quip for reminder selected")
+            if not q and row.get("by_boost"):
+                q = quip
+            if q:
+                text = "%s\n%s" % (q, text)
+
             if MENTIONS_EVERY_ONE:
                 if row["created_by"] != 'echo_cal':
                     requestor = str(row["created_by"])
